@@ -163,15 +163,15 @@
                 <select id="readerDarkColor" style="padding:10px; font-size:1rem; border-radius:6px; border:1px solid #444; background:#000; color:#fff; width:100%; margin-top:6px;">
                     <option value="black">黒</option>
                     <option value="red" selected>赤</option>
-                    <option value="cyan">水色</option>
+                    <option value="blue">青</option>
                 </select>
             </div>
             <div class="qr-data-card">
                 <label>明色（Twin1=白, Twin2=黒）</label>
                 <select id="readerLightColor" style="padding:10px; font-size:1rem; border-radius:6px; border:1px solid #444; background:#000; color:#fff; width:100%; margin-top:6px;">
                     <option value="white">白</option>
-                    <option value="yellow" selected>黄</option>
-                    <option value="pink">桃色</option>
+                    <option value="green" selected>緑</option>
+                    <option value="yellow">黄</option>
                 </select>
             </div>
             <button class="btn" style="background-color:#00897B;" onclick="startColorEncScan()">スキャン開始</button>
@@ -725,7 +725,7 @@
         });
 
         let colorEncDarkName = 'red';
-        let colorEncLightName = 'yellow';
+        let colorEncLightName = 'green';
 
         function cancelColorSettings() {
             document.getElementById('colorSettingsScreen').style.display = 'none';
@@ -761,231 +761,108 @@
             const { h, s, v } = rgbToHsv(r, g, b);
 
             // 黒の判定（明度が低い）
-            if (v < 0.30) {
-                // 暗色が黒の場合は、彩度で判断できない→黒として返す
-                if (darkName === 'black') return 'black';
-                // 色味がある場合はdarkかもしれない
-                if (s > 0.25) return classifyChromatic(h, s, v, darkName, lightName);
-                return 'black';
-            }
+            if (v < 0.25) return 'black';
 
             // 白の判定（明度が高く彩度が低い）
-            if (v > 0.70 && s < 0.20) {
-                if (lightName === 'white') return 'white';
-                return 'white';
+            if (v > 0.65 && s < 0.18) return 'white';
+
+            // 有彩色の判定（彩度がある程度ある）
+            if (s > 0.20 && v > 0.15) {
+                return classifyChromatic(h, s, v, darkName, lightName);
             }
 
-            // 有彩色の判定
-            if (s > 0.15) return classifyChromatic(h, s, v, darkName, lightName);
-
-            // グレー領域
-            if (v < 0.50) return 'black';
+            // グレー領域: 明度で黒白判定
+            if (v < 0.45) return 'black';
             return 'white';
         }
 
         function classifyChromatic(h, s, v, darkName, lightName) {
-            // 色名から期待される色相範囲を取得
+            // 新しい色セットの色相範囲
+            // Red(#FF0000): H≈0°   Blue(#0088FF): H≈210°
+            // Green(#00CC00): H≈120°  Yellow(#FFD700): H≈50°
             const colorRanges = {
-                'red': { hMin: -20, hMax: 30, hMin2: 330, hMax2: 361 },
-                'cyan': { hMin: 160, hMax: 210 },
-                'yellow': { hMin: 40, hMax: 80 },
-                'pink': { hMin: 300, hMax: 360, hMin2: -1, hMax2: 20 }
+                'red':    [{ min: 0, max: 25 }, { min: 335, max: 360 }],
+                'blue':   [{ min: 190, max: 240 }],
+                'green':  [{ min: 85, max: 160 }],
+                'yellow': [{ min: 35, max: 70 }]
             };
 
             function matchesColor(name) {
-                const range = colorRanges[name];
-                if (!range) return false;
-                if (h >= range.hMin && h <= range.hMax) return true;
-                if (range.hMin2 !== undefined && h >= range.hMin2 && h <= range.hMax2) return true;
+                const ranges = colorRanges[name];
+                if (!ranges) return false;
+                for (const range of ranges) {
+                    if (h >= range.min && h <= range.max) return true;
+                }
                 return false;
             }
 
-            // 暗色が有彩色の場合
-            if (darkName !== 'black' && matchesColor(darkName)) {
-                // 明度が低めなら暗色
-                if (v < 0.60) return 'dark';
-                return 'dark';
-            }
-            // 明色が有彩色の場合
-            if (lightName !== 'white' && matchesColor(lightName)) {
-                return 'light';
-            }
+            // 暗色判定（darkが有彩色の場合）
+            if (darkName !== 'black' && matchesColor(darkName)) return 'dark';
+            // 明色判定（lightが有彩色の場合）
+            if (lightName !== 'white' && matchesColor(lightName)) return 'light';
 
             // どちらにも一致しない場合、明度で判定
             if (v < 0.45) return 'black';
             return 'white';
         }
 
-        // カラーQRツインからセル色を読み取り、4つのQRに分離してデコード
+        // カラーQRツインからピクセルレベルで色→白黒変換し、4つのQRをデコード
         function processColorQRTwin(imageData, width, height) {
-            // Step 1: まず通常のjsQRでFinder Patternの位置を検出
-            // カラーQRツインにはQRのFinder Patternが含まれている（黒部分）
-            // jsQRのlocateで位置を取得
+            const src = imageData.data;
+            const pixelCount = width * height;
 
-            // まずグレースケール化してFinder Pattern検出を試みる
-            const grayData = new Uint8ClampedArray(width * height * 4);
-            for (let i = 0; i < width * height; i++) {
+            // Twin1用BW画像: black+dark→黒, light+white→白
+            const twin1Data = new Uint8ClampedArray(pixelCount * 4);
+            // Twin2用BW画像: black+light→黒, dark+white→白
+            const twin2Data = new Uint8ClampedArray(pixelCount * 4);
+
+            for (let i = 0; i < pixelCount; i++) {
                 const idx = i * 4;
-                const r = imageData.data[idx];
-                const g = imageData.data[idx + 1];
-                const b = imageData.data[idx + 2];
-                // 有彩色→白、黒→黒に変換（Finder Patternは黒白のみ）
-                const { s, v } = rgbToHsv(r, g, b);
-                let gray;
-                if (s > 0.30 && v > 0.25) {
-                    // 有彩色は白として扱う（Finder Pattern検出のため）
-                    gray = 255;
-                } else {
-                    gray = Math.round(v * 255);
-                }
-                grayData[idx] = gray;
-                grayData[idx + 1] = gray;
-                grayData[idx + 2] = gray;
-                grayData[idx + 3] = 255;
+                const r = src[idx], g = src[idx + 1], b = src[idx + 2];
+                const cls = classifyColor(r, g, b, colorEncDarkName, colorEncLightName);
+
+                // Twin1: black,dark→黒(0)  light,white→白(255)
+                const t1 = (cls === 'black' || cls === 'dark') ? 0 : 255;
+                twin1Data[idx] = t1;
+                twin1Data[idx + 1] = t1;
+                twin1Data[idx + 2] = t1;
+                twin1Data[idx + 3] = 255;
+
+                // Twin2: black,light→黒(0)  dark,white→白(255)
+                const t2 = (cls === 'black' || cls === 'light') ? 0 : 255;
+                twin2Data[idx] = t2;
+                twin2Data[idx + 1] = t2;
+                twin2Data[idx + 2] = t2;
+                twin2Data[idx + 3] = 255;
             }
 
-            // jsQRで位置検出を試みる
-            const results = jsQR(grayData, width, height, { inversionAttempts: "attemptBoth", multi: true });
-            if (!results || results.length === 0) return null;
+            // jsQRでTwin1をデコード（QR1とQR2が含まれる）
+            let d1 = null, d2 = null, d3 = null, d4 = null;
 
-            // 最初に見つかったQRの位置情報を使用
-            const qr = results[0];
-            if (!qr || !qr.location) return null;
-
-            // Finder Patternの位置からグリッド情報を推定
-            const loc = qr.location;
-            const tl = loc.topLeftCorner;
-            const tr = loc.topRightCorner;
-            const bl = loc.bottomLeftCorner;
-            const br = loc.bottomRightCorner;
-
-            // QRコードのモジュール数を推定
-            // jsQRのversion情報が取れれば使う
-            const version = qr.version || 0;
-            if (version === 0) return null;
-            const modules = version * 4 + 17;
-
-            // セルサイズを計算
-            const qrWidth = Math.sqrt(Math.pow(tr.x - tl.x, 2) + Math.pow(tr.y - tl.y, 2));
-            const qrHeight = Math.sqrt(Math.pow(bl.x - tl.x, 2) + Math.pow(bl.y - tl.y, 2));
-            const cellW = qrWidth / modules;
-            const cellH = qrHeight / modules;
-
-            // QRツインの構造:
-            // QR1は左上、QR2(回転)は右下にshift=8.5セル分ずれて配置
-            // Finder Patternで検出されたのはQR1の領域と思われる
-            // QR1の左上角 = tl からQuiet Zone分オフセット
-
-            // 方向ベクトル
-            const dxH = (tr.x - tl.x) / qrWidth; // 水平方向単位ベクトル
-            const dyH = (tr.y - tl.y) / qrWidth;
-            const dxV = (bl.x - tl.x) / qrHeight; // 垂直方向単位ベクトル
-            const dyV = (bl.y - tl.y) / qrHeight;
-
-            // セルの色をサンプリング
-            function sampleCell(originX, originY, row, col) {
-                // セル中心のピクセル座標
-                const cx = originX + (col + 0.5) * cellW * dxH + (row + 0.5) * cellH * dxV;
-                const cy = originY + (col + 0.5) * cellW * dyH + (row + 0.5) * cellH * dyV;
-
-                // 3x3サンプリング
-                let sumR = 0, sumG = 0, sumB = 0, count = 0;
-                for (let dy = -1; dy <= 1; dy++) {
-                    for (let dx = -1; dx <= 1; dx++) {
-                        const px = Math.round(cx + dx);
-                        const py = Math.round(cy + dy);
-                        if (px >= 0 && px < width && py >= 0 && py < height) {
-                            const idx = (py * width + px) * 4;
-                            sumR += imageData.data[idx];
-                            sumG += imageData.data[idx + 1];
-                            sumB += imageData.data[idx + 2];
-                            count++;
-                        }
-                    }
-                }
-                if (count === 0) return { r: 0, g: 0, b: 0 };
-                return { r: sumR / count, g: sumG / count, b: sumB / count };
-            }
-
-            const N = modules;
-            const shiftCells = 8.5;
-
-            // QR1の原点（左上のセル(0,0)の左上角）
-            // Finder Patternの中心は (3.5, 3.5) にある
-            // tlはFinder Patternの左上角あたりなので、tl ≈ originQR1
-            const originX = tl.x;
-            const originY = tl.y;
-
-            // 各QRのセル行列を構築
-            const qr1mat = Array.from({ length: N }, () => Array(N).fill(false));
-            const qr2mat = Array.from({ length: N }, () => Array(N).fill(false));
-            const qr3mat = Array.from({ length: N }, () => Array(N).fill(false));
-            const qr4mat = Array.from({ length: N }, () => Array(N).fill(false));
-
-            // QR1領域のセルを読む（左上部分）
-            for (let r = 0; r < N; r++) {
-                for (let c = 0; c < N; c++) {
-                    const rgb = sampleCell(originX, originY, r, c);
-                    const cls = classifyColor(rgb.r, rgb.g, rgb.b, colorEncDarkName, colorEncLightName);
-                    // Twin1: black→dark, dark→dark, light→white, white→white
-                    // Twin2: black→dark, dark→white, light→dark, white→white
-                    const twin1dark = (cls === 'black' || cls === 'dark');
-                    const twin2dark = (cls === 'black' || cls === 'light');
-                    qr1mat[r][c] = twin1dark; // QR1 = Twin1の左上
-                    qr3mat[r][c] = twin2dark; // QR3 = Twin2の左上
+            const res1 = jsQR(twin1Data, width, height, { inversionAttempts: "attemptBoth", multi: true });
+            if (res1) {
+                const items = Array.isArray(res1) ? res1 : [res1];
+                for (const qr of items) {
+                    if (!qr || !qr.data) continue;
+                    // 管理コードのbit15でQR番号を判別
+                    // topBit=0→QR1(正位置), topBit=1→QR2(180°回転)
+                    if (d1 === null) d1 = qr.data;
+                    else if (d2 === null) d2 = qr.data;
                 }
             }
 
-            // QR2領域のセルを読む（右下部分、shift済み）
-            // QR2(回転後)は originX + shiftCells * cellW, originY + shiftCells * cellH
-            const shiftPxX = shiftCells * cellW;
-            const shiftPxY = shiftCells * cellH;
-            const origin2X = originX + shiftPxX * dxH + shiftPxY * dxV;
-            const origin2Y = originY + shiftPxX * dyH + shiftPxY * dyV;
-
-            for (let r = 0; r < N; r++) {
-                for (let c = 0; c < N; c++) {
-                    const rgb = sampleCell(origin2X, origin2Y, r, c);
-                    const cls = classifyColor(rgb.r, rgb.g, rgb.b, colorEncDarkName, colorEncLightName);
-                    const twin1dark = (cls === 'black' || cls === 'dark');
-                    const twin2dark = (cls === 'black' || cls === 'light');
-                    // QR2(rotated) = Twin1の右下 → 180°逆回転して元に戻す
-                    qr2mat[N - 1 - r][N - 1 - c] = twin1dark;
-                    // QR4(rotated) = Twin2の右下 → 180°逆回転して元に戻す
-                    qr4mat[N - 1 - r][N - 1 - c] = twin2dark;
+            // jsQRでTwin2をデコード（QR3とQR4が含まれる）
+            const res2 = jsQR(twin2Data, width, height, { inversionAttempts: "attemptBoth", multi: true });
+            if (res2) {
+                const items = Array.isArray(res2) ? res2 : [res2];
+                for (const qr of items) {
+                    if (!qr || !qr.data) continue;
+                    if (d3 === null) d3 = qr.data;
+                    else if (d4 === null) d4 = qr.data;
                 }
             }
 
-            // Step 5: 各QR行列をCanvasに描画してjsQRでデコード
-            function decodeMatrix(mat) {
-                const cellSize = 10;
-                const quiet = 4;
-                const imgSize = (N + quiet * 2) * cellSize;
-                const tempCanvas = document.createElement('canvas');
-                tempCanvas.width = imgSize;
-                tempCanvas.height = imgSize;
-                const tCtx = tempCanvas.getContext('2d');
-                tCtx.fillStyle = '#ffffff';
-                tCtx.fillRect(0, 0, imgSize, imgSize);
-                tCtx.fillStyle = '#000000';
-                for (let r = 0; r < N; r++) {
-                    for (let c = 0; c < N; c++) {
-                        if (mat[r][c]) {
-                            tCtx.fillRect((c + quiet) * cellSize, (r + quiet) * cellSize, cellSize, cellSize);
-                        }
-                    }
-                }
-                const imgData = tCtx.getImageData(0, 0, imgSize, imgSize);
-                const result = jsQR(imgData.data, imgSize, imgSize, { inversionAttempts: "attemptBoth" });
-                if (result && result.data) return result.data;
-                return null;
-            }
-
-            const d1 = decodeMatrix(qr1mat);
-            const d2 = decodeMatrix(qr2mat);
-            const d3 = decodeMatrix(qr3mat);
-            const d4 = decodeMatrix(qr4mat);
-
+            if (!d1 && !d2 && !d3 && !d4) return null;
             return { qr1: d1, qr2: d2, qr3: d3, qr4: d4 };
         }
 
