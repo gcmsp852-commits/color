@@ -244,12 +244,13 @@
         let lastTwinBBox = null; // ★ Stage 1で検出したツインQRの領域を保存
 
         const SCAN_INTERVAL_MS = 50;
-        const COLOR_FAST_MAX_DIM = 720;
-        const COLOR_FULL_MAX_DIM = 960;
+        const COLOR_FAST_MAX_DIM = 420;
+        const COLOR_FULL_MAX_DIM = 640;
         const COLOR_FOCUS_MAX_DIM = 960;
-        const COLOR_FULL_SCAN_EVERY = 4;
-        const COLOR_FOCUS_REFRESH_EVERY = 12;
-        const COLOR_BBOX_PADDING = 96;
+        const COLOR_FULL_SCAN_EVERY = 10;
+        const COLOR_FOCUS_REFRESH_EVERY = 20;
+        const COLOR_DETECT_REFRESH_EVERY = 3;
+        const COLOR_BBOX_PADDING = 56;
 
         // モード: 'normal' or 'double'
         let scanMode = 'normal';
@@ -785,6 +786,39 @@
             }, maxWidth, maxHeight);
         }
 
+        function getBBoxArea(bbox) {
+            return bbox ? bbox.width * bbox.height : 0;
+        }
+
+        function pickLargestBarcodeBBox(barcodes, videoWidth, videoHeight) {
+            if (!barcodes || barcodes.length === 0) return null;
+            let bestBBox = null;
+            for (const barcode of barcodes) {
+                if (!barcode || !barcode.boundingBox) continue;
+                const normalized = normalizeBBox(barcode.boundingBox, videoWidth, videoHeight);
+                if (!normalized) continue;
+                if (!bestBBox || getBBoxArea(normalized) > getBBoxArea(bestBBox)) {
+                    bestBBox = normalized;
+                }
+            }
+            return bestBBox;
+        }
+
+        async function refreshColorScanBBox(videoWidth, videoHeight) {
+            if (!barcodeDetector) return;
+            const shouldRunDetector = !colorScanBBox || (colorScanAttemptCount % COLOR_DETECT_REFRESH_EVERY === 0);
+            if (!shouldRunDetector) return;
+            try {
+                const barcodes = await barcodeDetector.detect(video);
+                const detectedBBox = pickLargestBarcodeBBox(barcodes, videoWidth, videoHeight);
+                if (detectedBBox) {
+                    colorScanBBox = detectedBBox;
+                }
+            } catch (err) {
+                // Ignore detector errors and fall back to jsQR-based localization.
+            }
+        }
+
         function buildColorScanPlan(videoWidth, videoHeight) {
             const refreshFullFrame = colorScanAttemptCount > 0 && (colorScanAttemptCount % COLOR_FOCUS_REFRESH_EVERY === 0);
             const focusedBBox = (!refreshFullFrame && colorScanBBox)
@@ -1004,31 +1038,38 @@
             buffer[idx + 3] = 255;
         }
 
-        function collectColorDecodeResults(candidates, width, height, expectedCount = 2) {
+        function collectColorDecodeResults(scanPasses, width, height, expectedCount = 2, acceptQr = null) {
             const found = new Map();
-            for (const inversionAttempts of ['dontInvert', 'attemptBoth']) {
-                for (const candidate of candidates) {
-                    const res = jsQR(candidate, width, height, { inversionAttempts, multi: true });
-                    if (!res) continue;
-                    const items = Array.isArray(res) ? res : [res];
-                    for (const qr of items) {
-                        if (!qr || !qr.data) continue;
-                        const key = (qr.managementCode ?? 'none') + '::' + qr.data;
-                        if (!found.has(key)) {
-                            found.set(key, qr);
-                        }
+            for (const scanPass of scanPasses) {
+                if (!scanPass || !scanPass.data) continue;
+                const res = jsQR(scanPass.data, width, height, {
+                    inversionAttempts: scanPass.inversionAttempts || 'attemptBoth',
+                    multi: scanPass.multi !== false
+                });
+                if (!res) continue;
+                const items = Array.isArray(res) ? res : [res];
+                for (const qr of items) {
+                    if (!qr || !qr.data) continue;
+                    if (acceptQr && !acceptQr(qr)) continue;
+                    const key = (qr.managementCode ?? 'none') + '::' + qr.data;
+                    if (!found.has(key)) {
+                        found.set(key, qr);
                     }
-                    if (found.size >= expectedCount) {
-                        return Array.from(found.values());
-                    }
+                }
+                if (found.size >= expectedCount) {
+                    return Array.from(found.values());
                 }
             }
             return Array.from(found.values());
         }
 
+        function getColorPairTopBit(qr) {
+            return qr && qr.managementCode !== undefined ? ((qr.managementCode >>> 15) & 1) : null;
+        }
+
         function assignColorPairResult(target, zeroKey, oneKey, qr) {
             if (!qr || !qr.data) return;
-            const topBit = qr.managementCode === undefined ? null : ((qr.managementCode >>> 15) & 1);
+            const topBit = getColorPairTopBit(qr);
             if (topBit === 0) {
                 if (!target[zeroKey]) target[zeroKey] = qr.data;
                 return;
@@ -1105,8 +1146,20 @@
             const result = { qr1: null, qr2: null, qr3: null, qr4: null };
             let detectedBBox = null;
 
+            const twin1MissingCount = (existingResult && existingResult.qr1 ? 0 : 1) + (existingResult && existingResult.qr2 ? 0 : 1);
+            const twin2MissingCount = (existingResult && existingResult.qr3 ? 0 : 1) + (existingResult && existingResult.qr4 ? 0 : 1);
+
             if (needTwin1) {
-                const twin1Results = collectColorDecodeResults([twin1StrictData, twin1LegacyData], width, height, 2);
+                const twin1Results = collectColorDecodeResults([
+                    { data: twin1StrictData, inversionAttempts: 'dontInvert' },
+                    { data: twin1StrictData, inversionAttempts: 'attemptBoth' },
+                    { data: twin1LegacyData, inversionAttempts: 'attemptBoth' }
+                ], width, height, twin1MissingCount || 2, (qr) => {
+                    const topBit = getColorPairTopBit(qr);
+                    if (topBit === 0 && existingResult && existingResult.qr1) return false;
+                    if (topBit === 1 && existingResult && existingResult.qr2) return false;
+                    return true;
+                });
                 for (const qr of twin1Results) {
                     assignColorPairResult(result, 'qr1', 'qr2', qr);
                     detectedBBox = mergeLocationBBox(detectedBBox, qr);
@@ -1114,7 +1167,17 @@
             }
 
             if (needTwin2) {
-                const twin2Results = collectColorDecodeResults([twin2StrictData, twin2BiasedData, twin2LegacyData], width, height, 2);
+                const twin2Results = collectColorDecodeResults([
+                    { data: twin2BiasedData, inversionAttempts: 'dontInvert' },
+                    { data: twin2BiasedData, inversionAttempts: 'attemptBoth' },
+                    { data: twin2StrictData, inversionAttempts: 'attemptBoth' },
+                    { data: twin2LegacyData, inversionAttempts: 'attemptBoth' }
+                ], width, height, twin2MissingCount || 2, (qr) => {
+                    const topBit = getColorPairTopBit(qr);
+                    if (topBit === 0 && existingResult && existingResult.qr3) return false;
+                    if (topBit === 1 && existingResult && existingResult.qr4) return false;
+                    return true;
+                });
                 for (const qr of twin2Results) {
                     assignColorPairResult(result, 'qr3', 'qr4', qr);
                     detectedBBox = mergeLocationBBox(detectedBBox, qr);
@@ -1159,6 +1222,7 @@
                     // === Color QR Twin Mode ===
                     if (scanMode === 'color_enc') {
                         colorScanAttemptCount++;
+                        await refreshColorScanBBox(video.videoWidth, video.videoHeight);
                         const scanPlan = buildColorScanPlan(video.videoWidth, video.videoHeight);
                         zxingCanvas.width = scanPlan.targetWidth;
                         zxingCanvas.height = scanPlan.targetHeight;
