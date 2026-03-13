@@ -244,9 +244,9 @@
         let lastTwinBBox = null; // ★ Stage 1で検出したツインQRの領域を保存
 
         const SCAN_INTERVAL_MS = 50;
-        const COLOR_FAST_MAX_DIM = 420;
-        const COLOR_FULL_MAX_DIM = 640;
-        const COLOR_FOCUS_MAX_DIM = 960;
+        const COLOR_FAST_MAX_DIM = 320;
+        const COLOR_FULL_MAX_DIM = 480;
+        const COLOR_FOCUS_MAX_DIM = 640;
         const COLOR_FULL_SCAN_EVERY = 10;
         const COLOR_FOCUS_REFRESH_EVERY = 20;
         const COLOR_DETECT_REFRESH_EVERY = 3;
@@ -940,10 +940,7 @@
         }
 
         function distance3(r, g, b, profile) {
-            const dr = r - profile.r;
-            const dg = g - profile.g;
-            const db = b - profile.b;
-            return Math.sqrt(dr * dr + dg * dg + db * db);
+            return Math.abs(r - profile.r) + Math.abs(g - profile.g) + Math.abs(b - profile.b);
         }
 
         function classifyColorLegacyFromHsv(h, s, v, darkName, lightName) {
@@ -1169,32 +1166,30 @@
             const cropHeight = height - shiftPx;
 
             if (needZero) {
-                for (const scanPass of scanPasses) {
-                    const crop = cropMonochromeRgbaImage(scanPass.data, width, height, 0, 0, cropWidth, cropHeight);
-                    const qr = decodeSingleColorQr(crop, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 1);
-                    if (!qr) continue;
+                const scanPass = scanPasses[0];
+                const crop = cropMonochromeRgbaImage(scanPass.data, width, height, 0, 0, cropWidth, cropHeight);
+                const qr = decodeSingleColorQr(crop, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 1);
+                if (qr) {
                     const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
                     const key = getColorResultKey(adjusted);
                     if (!found.has(key)) {
                         found.set(key, adjusted);
                         detectedBBox = mergeLocationBBox(detectedBBox, adjusted);
                     }
-                    break;
                 }
             }
 
             if (needOne) {
-                for (const scanPass of scanPasses) {
-                    const crop = cropMonochromeRgbaImage(scanPass.data, width, height, shiftPx, shiftPx, cropWidth, cropHeight);
-                    const qr = decodeSingleColorQr(crop, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 0);
-                    if (!qr) continue;
+                const scanPass = scanPasses[0];
+                const crop = cropMonochromeRgbaImage(scanPass.data, width, height, shiftPx, shiftPx, cropWidth, cropHeight);
+                const qr = decodeSingleColorQr(crop, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 0);
+                if (qr) {
                     const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
                     const key = getColorResultKey(adjusted);
                     if (!found.has(key)) {
                         found.set(key, adjusted);
                         detectedBBox = mergeLocationBBox(detectedBBox, adjusted);
                     }
-                    break;
                 }
             }
 
@@ -1245,10 +1240,7 @@
             const profiles = getSelectedColorProfiles(colorEncDarkName, colorEncLightName);
 
             const twin1StrictData = needTwin1 ? new Uint8ClampedArray(pixelCount * 4) : null;
-            const twin1LegacyData = needTwin1 ? new Uint8ClampedArray(pixelCount * 4) : null;
-            const twin2StrictData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
             const twin2BiasedData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
-            const twin2LegacyData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
 
             for (let i = 0; i < pixelCount; i++) {
                 const idx = i * 4;
@@ -1257,23 +1249,18 @@
                 const b = src[idx + 2];
                 const hsv = rgbToHsv(r, g, b);
                 const strictCls = classifyColorPreciseWithHsv(r, g, b, hsv.h, hsv.s, hsv.v, profiles, colorEncDarkName, colorEncLightName);
-                const legacyCls = classifyColorLegacyFromHsv(hsv.h, hsv.s, hsv.v, colorEncDarkName, colorEncLightName);
 
                 if (needTwin1) {
-                    const strictValue = (strictCls === 'black' || strictCls === 'dark') ? 0 : 255;
-                    const legacyValue = (legacyCls === 'black' || legacyCls === 'dark') ? 0 : 255;
-                    setGrayPixel(twin1StrictData, idx, strictValue);
-                    setGrayPixel(twin1LegacyData, idx, legacyValue);
+                    setGrayPixel(twin1StrictData, idx, (strictCls === 'black' || strictCls === 'dark') ? 0 : 255);
                 }
 
                 if (needTwin2) {
+                    const legacyCls = classifyColorLegacyFromHsv(hsv.h, hsv.s, hsv.v, colorEncDarkName, colorEncLightName);
                     let twin2Cls = strictCls;
                     if (strictCls === 'black' && legacyCls === 'dark') twin2Cls = 'dark';
                     else if (strictCls === 'white' && legacyCls === 'light') twin2Cls = 'light';
 
-                    setGrayPixel(twin2StrictData, idx, (strictCls === 'black' || strictCls === 'light') ? 0 : 255);
                     setGrayPixel(twin2BiasedData, idx, (twin2Cls === 'black' || twin2Cls === 'light') ? 0 : 255);
-                    setGrayPixel(twin2LegacyData, idx, (legacyCls === 'black' || legacyCls === 'light') ? 0 : 255);
                 }
             }
 
@@ -1288,61 +1275,22 @@
             if (needTwin1) {
                 const twin1Targeted = decodeTargetedColorPair([
                     { data: twin1StrictData, inversionAttempts: 'dontInvert' },
-                    { data: twin1StrictData, inversionAttempts: 'attemptBoth' },
-                    { data: twin1LegacyData, inversionAttempts: 'attemptBoth' }
+                    { data: twin1StrictData, inversionAttempts: 'attemptBoth' }
                 ], width, height, needQr1, needQr2);
                 for (const qr of twin1Targeted.results) {
                     assignColorPairResult(result, 'qr1', 'qr2', qr);
                     detectedBBox = mergeLocationBBox(detectedBBox, qr);
-                }
-
-                const twin1MissingCount = (needQr1 && !result.qr1 ? 1 : 0) + (needQr2 && !result.qr2 ? 1 : 0);
-                if (twin1MissingCount > 0) {
-                    const twin1Results = collectColorDecodeResults([
-                        { data: twin1StrictData, inversionAttempts: 'dontInvert', multi: true },
-                        { data: twin1StrictData, inversionAttempts: 'attemptBoth', multi: true },
-                        { data: twin1LegacyData, inversionAttempts: 'attemptBoth', multi: true }
-                    ], width, height, twin1MissingCount, (qr) => {
-                        const topBit = getColorPairTopBit(qr);
-                        if ((topBit === 0 || topBit === null) && (!needQr1 || result.qr1)) return false;
-                        if (topBit === 1 && (!needQr2 || result.qr2)) return false;
-                        return true;
-                    });
-                    for (const qr of twin1Results) {
-                        assignColorPairResult(result, 'qr1', 'qr2', qr);
-                        detectedBBox = mergeLocationBBox(detectedBBox, qr);
-                    }
                 }
             }
 
             if (needTwin2) {
                 const twin2Targeted = decodeTargetedColorPair([
                     { data: twin2BiasedData, inversionAttempts: 'dontInvert' },
-                    { data: twin2BiasedData, inversionAttempts: 'attemptBoth' },
-                    { data: twin2StrictData, inversionAttempts: 'attemptBoth' }
+                    { data: twin2BiasedData, inversionAttempts: 'attemptBoth' }
                 ], width, height, needQr3, needQr4);
                 for (const qr of twin2Targeted.results) {
                     assignColorPairResult(result, 'qr3', 'qr4', qr);
                     detectedBBox = mergeLocationBBox(detectedBBox, qr);
-                }
-
-                const twin2MissingCount = (needQr3 && !result.qr3 ? 1 : 0) + (needQr4 && !result.qr4 ? 1 : 0);
-                if (twin2MissingCount > 0) {
-                    const twin2Results = collectColorDecodeResults([
-                        { data: twin2BiasedData, inversionAttempts: 'dontInvert', multi: true },
-                        { data: twin2BiasedData, inversionAttempts: 'attemptBoth', multi: true },
-                        { data: twin2StrictData, inversionAttempts: 'attemptBoth', multi: true },
-                        { data: twin2LegacyData, inversionAttempts: 'attemptBoth', multi: true }
-                    ], width, height, twin2MissingCount, (qr) => {
-                        const topBit = getColorPairTopBit(qr);
-                        if ((topBit === 0 || topBit === null) && (!needQr3 || result.qr3)) return false;
-                        if (topBit === 1 && (!needQr4 || result.qr4)) return false;
-                        return true;
-                    });
-                    for (const qr of twin2Results) {
-                        assignColorPairResult(result, 'qr3', 'qr4', qr);
-                        detectedBBox = mergeLocationBBox(detectedBBox, qr);
-                    }
                 }
             }
 
