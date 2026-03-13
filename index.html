@@ -745,7 +745,7 @@
         }
 
         function resetColorScanResult() {
-            colorScanResult = { qr1: null, qr2: null, qr3: null, qr4: null };
+            colorScanResult = { qr1: null, qr2: null, qr3: null, qr4: null, _loc: null };
             colorScanBBox = null;
             colorScanAttemptCount = 0;
         }
@@ -1329,43 +1329,167 @@
                 lastDetectTime = now;
 
                 try {
-                    // === Color QR Twin Mode ===
+                    // === Color QR Twin Mode (B/W + Color hybrid) ===
                     if (scanMode === 'color_enc') {
                         colorScanAttemptCount++;
-                        await refreshColorScanBBox(video.videoWidth, video.videoHeight);
-                        const scanPlan = buildColorScanPlan(video.videoWidth, video.videoHeight);
-                        zxingCanvas.width = scanPlan.targetWidth;
-                        zxingCanvas.height = scanPlan.targetHeight;
-                        zxingCtx.drawImage(
-                            video,
-                            scanPlan.sx,
-                            scanPlan.sy,
-                            scanPlan.sw,
-                            scanPlan.sh,
-                            0,
-                            0,
-                            scanPlan.targetWidth,
-                            scanPlan.targetHeight
-                        );
-                        const colorImgData = zxingCtx.getImageData(0, 0, scanPlan.targetWidth, scanPlan.targetHeight);
+                        const vw = video.videoWidth;
+                        const vh = video.videoHeight;
 
-                        const colorResult = processColorQRTwin(colorImgData, scanPlan.targetWidth, scanPlan.targetHeight, colorScanResult);
-                        if (colorResult && colorResult.bbox) {
-                            const mappedBBox = mapScanBBoxToVideo(colorResult.bbox, scanPlan, video.videoWidth, video.videoHeight);
-                            if (mappedBBox) {
-                                colorScanBBox = mergeBBox(colorScanBBox, mappedBBox);
+                        // --- Phase 1: B/W reading for Twin1 (QR1 + QR2) ---
+                        // B/W thresholding naturally separates (black+darkColor) from (lightColor+white)
+                        // which exactly matches Twin1's encoding, so standard jsQR reads QR1 and QR2 directly.
+                        const needQ1 = !colorScanResult.qr1;
+                        const needQ2 = !colorScanResult.qr2;
+
+                        if (needQ1 || needQ2) {
+                            let bwItems = [];
+
+                            // Try BarcodeDetector first for fast localization
+                            if (barcodeDetector) {
+                                try {
+                                    const barcodes = await barcodeDetector.detect(video);
+                                    if (barcodes && barcodes.length > 0) {
+                                        for (const b of barcodes) {
+                                            const bbox = b.boundingBox;
+                                            const PAD = 50;
+                                            const sx = Math.max(0, Math.floor(bbox.x) - PAD);
+                                            const sy = Math.max(0, Math.floor(bbox.y) - PAD);
+                                            const sw = Math.min(vw - sx, Math.ceil(bbox.width) + PAD * 2);
+                                            const sh = Math.min(vh - sy, Math.ceil(bbox.height) + PAD * 2);
+                                            zxingCanvas.width = sw;
+                                            zxingCanvas.height = sh;
+                                            zxingCtx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
+                                            const imgData = zxingCtx.getImageData(0, 0, sw, sh);
+                                            const resList = jsQR(imgData.data, sw, sh, { inversionAttempts: "attemptBoth", multi: true });
+                                            if (resList) {
+                                                const items = Array.isArray(resList) ? resList : [resList];
+                                                for (const res of items) {
+                                                    if (res && res.data && !res.isRaw) {
+                                                        bwItems.push({
+                                                            data: res.data,
+                                                            managementCode: res.managementCode,
+                                                            location: {
+                                                                topLeftCorner: { x: res.location.topLeftCorner.x + sx, y: res.location.topLeftCorner.y + sy },
+                                                                topRightCorner: { x: res.location.topRightCorner.x + sx, y: res.location.topRightCorner.y + sy },
+                                                                bottomRightCorner: { x: res.location.bottomRightCorner.x + sx, y: res.location.bottomRightCorner.y + sy },
+                                                                bottomLeftCorner: { x: res.location.bottomLeftCorner.x + sx, y: res.location.bottomLeftCorner.y + sy }
+                                                            },
+                                                            version: res.version
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch(err) {}
+                            }
+
+                            // Fallback: full-frame jsQR
+                            if (bwItems.length === 0) {
+                                zxingCanvas.width = vw;
+                                zxingCanvas.height = vh;
+                                zxingCtx.drawImage(video, 0, 0, vw, vh);
+                                const fullData = zxingCtx.getImageData(0, 0, vw, vh);
+                                let resList = jsQR(fullData.data, vw, vh, { inversionAttempts: "attemptBoth", multi: true });
+                                if (resList) {
+                                    const items = Array.isArray(resList) ? resList : [resList];
+                                    for (const res of items) {
+                                        if (res && res.data && !res.isRaw) {
+                                            bwItems.push({
+                                                data: res.data,
+                                                managementCode: res.managementCode,
+                                                location: res.location,
+                                                version: res.version
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Assign Twin1 results
+                            for (const item of bwItems) {
+                                const topBit = ((item.managementCode || 0) >> 15) & 1;
+                                if (topBit === 0 && needQ1) {
+                                    colorScanResult.qr1 = item.data;
+                                    colorScanResult._loc = item.location;
+                                }
+                                if (topBit === 1 && needQ2) {
+                                    colorScanResult.qr2 = item.data;
+                                    if (!colorScanResult._loc) colorScanResult._loc = item.location;
+                                }
                             }
                         }
 
-                        const mergedColorResult = mergeColorScanResult(colorResult);
-                        const colorCount = countColorScanResult(mergedColorResult);
+                        // --- Phase 2: Color classification for Twin2 (QR3 + QR4) ---
+                        // Twin2 mapping: (black||lightColor) → dark, (darkColor||white) → light
+                        // This CANNOT be obtained by simple B/W thresholding, so we need color classification.
+                        const needQ3 = !colorScanResult.qr3;
+                        const needQ4 = !colorScanResult.qr4;
+
+                        if (needQ3 || needQ4) {
+                            // Determine crop region (use detected QR location if available)
+                            let cx = 0, cy = 0, cw = vw, ch = vh;
+                            if (colorScanResult._loc) {
+                                const loc = colorScanResult._loc;
+                                const pts = [loc.topLeftCorner, loc.topRightCorner, loc.bottomRightCorner, loc.bottomLeftCorner];
+                                const xs = pts.map(p => p.x);
+                                const ys = pts.map(p => p.y);
+                                const PAD = 80;
+                                cx = Math.max(0, Math.floor(Math.min(...xs)) - PAD);
+                                cy = Math.max(0, Math.floor(Math.min(...ys)) - PAD);
+                                cw = Math.min(vw - cx, Math.ceil(Math.max(...xs) - Math.min(...xs)) + PAD * 2);
+                                ch = Math.min(vh - cy, Math.ceil(Math.max(...ys) - Math.min(...ys)) + PAD * 2);
+                            }
+
+                            if (cw > 10 && ch > 10) {
+                                // Capture cropped region at native resolution
+                                zxingCanvas.width = cw;
+                                zxingCanvas.height = ch;
+                                zxingCtx.drawImage(video, cx, cy, cw, ch, 0, 0, cw, ch);
+                                const cropData = zxingCtx.getImageData(0, 0, cw, ch);
+
+                                // Create Twin2 monochrome
+                                const monoData = new Uint8ClampedArray(cw * ch * 4);
+                                const src = cropData.data;
+                                const profiles = getSelectedColorProfiles(colorEncDarkName, colorEncLightName);
+
+                                for (let i = 0, len = cw * ch; i < len; i++) {
+                                    const idx = i * 4;
+                                    const r = src[idx], g = src[idx + 1], b = src[idx + 2];
+                                    const hsv = rgbToHsv(r, g, b);
+                                    const cls = classifyColorPreciseWithHsv(r, g, b, hsv.h, hsv.s, hsv.v, profiles, colorEncDarkName, colorEncLightName);
+                                    // Twin2: (black||light) → 0, (dark||white) → 255
+                                    const val = (cls === 'black' || cls === 'light') ? 0 : 255;
+                                    monoData[idx] = val;
+                                    monoData[idx + 1] = val;
+                                    monoData[idx + 2] = val;
+                                    monoData[idx + 3] = 255;
+                                }
+
+                                // Decode Twin2
+                                let twin2Results = jsQR(monoData, cw, ch, { inversionAttempts: "attemptBoth", multi: true });
+                                if (twin2Results) {
+                                    const items = Array.isArray(twin2Results) ? twin2Results : [twin2Results];
+                                    for (const res of items) {
+                                        if (res && res.data && !res.isRaw) {
+                                            const topBit = ((res.managementCode || 0) >> 15) & 1;
+                                            if (topBit === 0 && needQ3) colorScanResult.qr3 = res.data;
+                                            if (topBit === 1 && needQ4) colorScanResult.qr4 = res.data;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Check completion
+                        const colorCount = countColorScanResult(colorScanResult);
                         if (colorCount > 0 && colorCount < 4) {
                             statusText.innerText = 'Color QR Twin scanning... (' + colorCount + '/4)';
                         }
                         if (colorCount === 4) {
                             isScanning = false;
                             isProcessing = false;
-                            showColorResult(mergedColorResult);
+                            showColorResult(colorScanResult);
                             return;
                         }
                         isProcessing = false;
