@@ -1334,17 +1334,21 @@
                         colorScanAttemptCount++;
                         const vw = video.videoWidth;
                         const vh = video.videoHeight;
+                        let needQ1 = !colorScanResult.qr1;
+                        let needQ2 = !colorScanResult.qr2;
 
-                        // --- Phase 1: B/W reading for Twin1 (QR1 + QR2) ---
-                        // B/W thresholding naturally separates (black+darkColor) from (lightColor+white)
-                        // which exactly matches Twin1's encoding, so standard jsQR reads QR1 and QR2 directly.
-                        const needQ1 = !colorScanResult.qr1;
-                        const needQ2 = !colorScanResult.qr2;
-
+                        // --- Phase 1 (fast path): Enhanced-grayscale B/W reading for Twin1 ---
+                        // Use the light color's dominant channel as grayscale to maximize contrast.
+                        // e.g. G channel: black=0, red=0, green=204, white=255 → gap=204 (vs luma gap=44)
                         if (needQ1 || needQ2) {
-                            let bwItems = [];
+                            // Determine optimal channel index for Twin1 contrast
+                            let chIdx = 1; // G channel (default, works for green/yellow light)
+                            if (colorEncLightName === 'white') {
+                                chIdx = (colorEncDarkName === 'blue') ? 0 : 1; // R for blue dark, G otherwise
+                            }
 
-                            // Try BarcodeDetector first for fast localization
+                            // Try BarcodeDetector for fast localization, then enhanced jsQR decode
+                            let bwItems = [];
                             if (barcodeDetector) {
                                 try {
                                     const barcodes = await barcodeDetector.detect(video);
@@ -1360,6 +1364,12 @@
                                             zxingCanvas.height = sh;
                                             zxingCtx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
                                             const imgData = zxingCtx.getImageData(0, 0, sw, sh);
+                                            // Enhance: replace RGB with the optimal single channel
+                                            for (let p = 0, pLen = sw * sh; p < pLen; p++) {
+                                                const pi = p * 4;
+                                                const v = imgData.data[pi + chIdx];
+                                                imgData.data[pi] = v; imgData.data[pi + 1] = v; imgData.data[pi + 2] = v;
+                                            }
                                             const resList = jsQR(imgData.data, sw, sh, { inversionAttempts: "attemptBoth", multi: true });
                                             if (resList) {
                                                 const items = Array.isArray(resList) ? resList : [resList];
@@ -1368,12 +1378,6 @@
                                                         bwItems.push({
                                                             data: res.data,
                                                             managementCode: res.managementCode,
-                                                            location: {
-                                                                topLeftCorner: { x: res.location.topLeftCorner.x + sx, y: res.location.topLeftCorner.y + sy },
-                                                                topRightCorner: { x: res.location.topRightCorner.x + sx, y: res.location.topRightCorner.y + sy },
-                                                                bottomRightCorner: { x: res.location.bottomRightCorner.x + sx, y: res.location.bottomRightCorner.y + sy },
-                                                                bottomLeftCorner: { x: res.location.bottomLeftCorner.x + sx, y: res.location.bottomLeftCorner.y + sy }
-                                                            },
                                                             version: res.version
                                                         });
                                                     }
@@ -1384,13 +1388,23 @@
                                 } catch(err) {}
                             }
 
-                            // Fallback: full-frame jsQR
+                            // Fallback: full-frame enhanced jsQR
                             if (bwItems.length === 0) {
-                                zxingCanvas.width = vw;
-                                zxingCanvas.height = vh;
-                                zxingCtx.drawImage(video, 0, 0, vw, vh);
-                                const fullData = zxingCtx.getImageData(0, 0, vw, vh);
-                                let resList = jsQR(fullData.data, vw, vh, { inversionAttempts: "attemptBoth", multi: true });
+                                const maxBwDim = 640;
+                                const bwS = Math.min(1, maxBwDim / Math.max(vw, vh));
+                                const bwW = Math.round(vw * bwS);
+                                const bwH = Math.round(vh * bwS);
+                                zxingCanvas.width = bwW;
+                                zxingCanvas.height = bwH;
+                                zxingCtx.drawImage(video, 0, 0, bwW, bwH);
+                                const fullData = zxingCtx.getImageData(0, 0, bwW, bwH);
+                                // Enhance grayscale
+                                for (let p = 0, pLen = bwW * bwH; p < pLen; p++) {
+                                    const pi = p * 4;
+                                    const v = fullData.data[pi + chIdx];
+                                    fullData.data[pi] = v; fullData.data[pi + 1] = v; fullData.data[pi + 2] = v;
+                                }
+                                let resList = jsQR(fullData.data, bwW, bwH, { inversionAttempts: "attemptBoth", multi: true });
                                 if (resList) {
                                     const items = Array.isArray(resList) ? resList : [resList];
                                     for (const res of items) {
@@ -1398,7 +1412,6 @@
                                             bwItems.push({
                                                 data: res.data,
                                                 managementCode: res.managementCode,
-                                                location: res.location,
                                                 version: res.version
                                             });
                                         }
@@ -1406,29 +1419,26 @@
                                 }
                             }
 
-                            // Assign Twin1 results
+                            // Assign Twin1 results from enhanced B/W
                             for (const item of bwItems) {
                                 const topBit = ((item.managementCode || 0) >> 15) & 1;
-                                if (topBit === 0 && needQ1) {
-                                    colorScanResult.qr1 = item.data;
-                                    colorScanResult._loc = item.location;
-                                }
-                                if (topBit === 1 && needQ2) {
-                                    colorScanResult.qr2 = item.data;
-                                    if (!colorScanResult._loc) colorScanResult._loc = item.location;
-                                }
+                                if (topBit === 0 && !colorScanResult.qr1) colorScanResult.qr1 = item.data;
+                                if (topBit === 1 && !colorScanResult.qr2) colorScanResult.qr2 = item.data;
                             }
+                            needQ1 = !colorScanResult.qr1;
+                            needQ2 = !colorScanResult.qr2;
                         }
 
-                        // --- Phase 2: Color classification for Twin2 (QR3 + QR4) ---
-                        // Twin2 mapping: (black||lightColor) → dark, (darkColor||white) → light
-                        // This CANNOT be obtained by simple B/W thresholding, so we need color classification.
-                        // Uses the existing decodeTargetedColorPair for robust overlapping QR detection.
+                        // --- Phase 2: Unified color classification for Twin1 fallback + Twin2 ---
+                        // Single pixel-classification pass creates both Twin1 and Twin2 monochrome buffers.
+                        // Twin1 mono: (black||dark) → 0, (light||white) → 255
+                        // Twin2 mono: (black||light) → 0, (dark||white) → 255  (biased strategy)
                         const needQ3 = !colorScanResult.qr3;
                         const needQ4 = !colorScanResult.qr4;
+                        const needTwin1Fallback = needQ1 || needQ2;
+                        const needTwin2 = needQ3 || needQ4;
 
-                        if (needQ3 || needQ4) {
-                            // Capture full frame at moderate resolution for color classification
+                        if (needTwin1Fallback || needTwin2) {
                             const maxColorDim = 640;
                             const cScale = Math.min(1, maxColorDim / Math.max(vw, vh));
                             const tw = Math.round(vw * cScale);
@@ -1442,8 +1452,8 @@
                             const profiles = getSelectedColorProfiles(colorEncDarkName, colorEncLightName);
                             const pixelCount = tw * th;
 
-                            // Create Twin2 monochrome with biased strategy (same as processColorQRTwin)
-                            const twin2Mono = new Uint8ClampedArray(pixelCount * 4);
+                            const twin1Mono = needTwin1Fallback ? new Uint8ClampedArray(pixelCount * 4) : null;
+                            const twin2Mono = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
 
                             for (let i = 0; i < pixelCount; i++) {
                                 const idx = i * 4;
@@ -1453,31 +1463,53 @@
                                     r, g, b, hsv.h, hsv.s, hsv.v,
                                     profiles, colorEncDarkName, colorEncLightName
                                 );
-                                const legacyCls = classifyColorLegacyFromHsv(
-                                    hsv.h, hsv.s, hsv.v,
-                                    colorEncDarkName, colorEncLightName
-                                );
 
-                                // Biased: start with strict, adjust boundary cases with legacy
-                                let twin2Cls = strictCls;
-                                if (strictCls === 'black' && legacyCls === 'dark') twin2Cls = 'dark';
-                                else if (strictCls === 'white' && legacyCls === 'light') twin2Cls = 'light';
+                                if (twin1Mono) {
+                                    // Twin1: (black||dark) → 0, (light||white) → 255
+                                    setGrayPixel(twin1Mono, idx,
+                                        (strictCls === 'black' || strictCls === 'dark') ? 0 : 255
+                                    );
+                                }
 
-                                // Twin2: (black||light) → 0 (dark), (dark||white) → 255 (light)
-                                setGrayPixel(twin2Mono, idx,
-                                    (twin2Cls === 'black' || twin2Cls === 'light') ? 0 : 255
-                                );
+                                if (twin2Mono) {
+                                    const legacyCls = classifyColorLegacyFromHsv(
+                                        hsv.h, hsv.s, hsv.v,
+                                        colorEncDarkName, colorEncLightName
+                                    );
+                                    // Biased: start with strict, adjust boundary cases with legacy
+                                    let twin2Cls = strictCls;
+                                    if (strictCls === 'black' && legacyCls === 'dark') twin2Cls = 'dark';
+                                    else if (strictCls === 'white' && legacyCls === 'light') twin2Cls = 'light';
+                                    // Twin2: (black||light) → 0, (dark||white) → 255
+                                    setGrayPixel(twin2Mono, idx,
+                                        (twin2Cls === 'black' || twin2Cls === 'light') ? 0 : 255
+                                    );
+                                }
                             }
 
-                            // Use existing targeted decoder (handles overlapping QR pairs robustly)
-                            const twin2Targeted = decodeTargetedColorPair([
-                                { data: twin2Mono, inversionAttempts: 'dontInvert' },
-                                { data: twin2Mono, inversionAttempts: 'attemptBoth' }
-                            ], tw, th, needQ3, needQ4);
+                            // Decode Twin1 (fallback path)
+                            if (twin1Mono && needTwin1Fallback) {
+                                const twin1Targeted = decodeTargetedColorPair([
+                                    { data: twin1Mono, inversionAttempts: 'dontInvert' },
+                                    { data: twin1Mono, inversionAttempts: 'attemptBoth' }
+                                ], tw, th, needQ1, needQ2);
+                                if (twin1Targeted && twin1Targeted.results) {
+                                    for (const qr of twin1Targeted.results) {
+                                        assignColorPairResult(colorScanResult, 'qr1', 'qr2', qr);
+                                    }
+                                }
+                            }
 
-                            if (twin2Targeted && twin2Targeted.results) {
-                                for (const qr of twin2Targeted.results) {
-                                    assignColorPairResult(colorScanResult, 'qr3', 'qr4', qr);
+                            // Decode Twin2
+                            if (twin2Mono && needTwin2) {
+                                const twin2Targeted = decodeTargetedColorPair([
+                                    { data: twin2Mono, inversionAttempts: 'dontInvert' },
+                                    { data: twin2Mono, inversionAttempts: 'attemptBoth' }
+                                ], tw, th, needQ3, needQ4);
+                                if (twin2Targeted && twin2Targeted.results) {
+                                    for (const qr of twin2Targeted.results) {
+                                        assignColorPairResult(colorScanResult, 'qr3', 'qr4', qr);
+                                    }
                                 }
                             }
                         }
