@@ -1430,16 +1430,17 @@
                         }
 
                         // --- Phase 2: Unified color classification for Twin1 fallback + Twin2 ---
-                        // Single pixel-classification pass creates both Twin1 and Twin2 monochrome buffers.
-                        // Twin1 mono: (black||dark) → 0, (light||white) → 255
-                        // Twin2 mono: (black||light) → 0, (dark||white) → 255  (biased strategy)
+                        // Uses NATIVE resolution for maximum classification accuracy.
+                        // Creates both strict and biased monochrome images, tries each separately
+                        // with decodeTargetedColorPair (which uses scanPasses[0] for targeted crops).
                         const needQ3 = !colorScanResult.qr3;
                         const needQ4 = !colorScanResult.qr4;
                         const needTwin1Fallback = needQ1 || needQ2;
                         const needTwin2 = needQ3 || needQ4;
 
                         if (needTwin1Fallback || needTwin2) {
-                            const maxColorDim = 640;
+                            // Use native resolution (capped at 960px) for accurate color classification
+                            const maxColorDim = 960;
                             const cScale = Math.min(1, maxColorDim / Math.max(vw, vh));
                             const tw = Math.round(vw * cScale);
                             const th = Math.round(vh * cScale);
@@ -1452,9 +1453,12 @@
                             const profiles = getSelectedColorProfiles(colorEncDarkName, colorEncLightName);
                             const pixelCount = tw * th;
 
-                            const twin1Mono = needTwin1Fallback ? new Uint8ClampedArray(pixelCount * 4) : null;
-                            const twin2Mono = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
+                            // Allocate buffers: strict + biased for each twin
+                            const t1Strict = needTwin1Fallback ? new Uint8ClampedArray(pixelCount * 4) : null;
+                            const t2Strict = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
+                            const t2Biased = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
 
+                            // Single pass: classify each pixel once, write to all needed buffers
                             for (let i = 0; i < pixelCount; i++) {
                                 const idx = i * 4;
                                 const r = src[idx], g = src[idx + 1], b = src[idx + 2];
@@ -1464,51 +1468,77 @@
                                     profiles, colorEncDarkName, colorEncLightName
                                 );
 
-                                if (twin1Mono) {
+                                if (t1Strict) {
                                     // Twin1: (black||dark) → 0, (light||white) → 255
-                                    setGrayPixel(twin1Mono, idx,
+                                    setGrayPixel(t1Strict, idx,
                                         (strictCls === 'black' || strictCls === 'dark') ? 0 : 255
                                     );
                                 }
 
-                                if (twin2Mono) {
+                                if (needTwin2) {
+                                    // Twin2 strict: (black||light) → 0, (dark||white) → 255
+                                    setGrayPixel(t2Strict, idx,
+                                        (strictCls === 'black' || strictCls === 'light') ? 0 : 255
+                                    );
+
+                                    // Twin2 biased: adjust boundary cases with legacy classifier
                                     const legacyCls = classifyColorLegacyFromHsv(
                                         hsv.h, hsv.s, hsv.v,
                                         colorEncDarkName, colorEncLightName
                                     );
-                                    // Biased: start with strict, adjust boundary cases with legacy
                                     let twin2Cls = strictCls;
                                     if (strictCls === 'black' && legacyCls === 'dark') twin2Cls = 'dark';
                                     else if (strictCls === 'white' && legacyCls === 'light') twin2Cls = 'light';
-                                    // Twin2: (black||light) → 0, (dark||white) → 255
-                                    setGrayPixel(twin2Mono, idx,
+                                    setGrayPixel(t2Biased, idx,
                                         (twin2Cls === 'black' || twin2Cls === 'light') ? 0 : 255
                                     );
                                 }
                             }
 
-                            // Decode Twin1 (fallback path)
-                            if (twin1Mono && needTwin1Fallback) {
-                                const twin1Targeted = decodeTargetedColorPair([
-                                    { data: twin1Mono, inversionAttempts: 'dontInvert' },
-                                    { data: twin1Mono, inversionAttempts: 'attemptBoth' }
+                            // --- Decode Twin1 (fallback path) ---
+                            if (t1Strict && needTwin1Fallback) {
+                                const t1Result = decodeTargetedColorPair([
+                                    { data: t1Strict, inversionAttempts: 'dontInvert' },
+                                    { data: t1Strict, inversionAttempts: 'attemptBoth' }
                                 ], tw, th, needQ1, needQ2);
-                                if (twin1Targeted && twin1Targeted.results) {
-                                    for (const qr of twin1Targeted.results) {
+                                if (t1Result && t1Result.results) {
+                                    for (const qr of t1Result.results) {
                                         assignColorPairResult(colorScanResult, 'qr1', 'qr2', qr);
                                     }
                                 }
                             }
 
-                            // Decode Twin2
-                            if (twin2Mono && needTwin2) {
-                                const twin2Targeted = decodeTargetedColorPair([
-                                    { data: twin2Mono, inversionAttempts: 'dontInvert' },
-                                    { data: twin2Mono, inversionAttempts: 'attemptBoth' }
-                                ], tw, th, needQ3, needQ4);
-                                if (twin2Targeted && twin2Targeted.results) {
-                                    for (const qr of twin2Targeted.results) {
+                            // --- Decode Twin2: try strict first, then biased ---
+                            // decodeTargetedColorPair uses scanPasses[0] for targeted crops,
+                            // so we call it separately for each strategy to ensure the
+                            // targeted crop uses the matching classification data.
+                            if (needTwin2) {
+                                // Strategy 1: Strict classification
+                                const t2s1 = decodeTargetedColorPair([
+                                    { data: t2Strict, inversionAttempts: 'dontInvert' },
+                                    { data: t2Strict, inversionAttempts: 'attemptBoth' }
+                                ], tw, th,
+                                    !colorScanResult.qr3 && needQ3,
+                                    !colorScanResult.qr4 && needQ4
+                                );
+                                if (t2s1 && t2s1.results) {
+                                    for (const qr of t2s1.results) {
                                         assignColorPairResult(colorScanResult, 'qr3', 'qr4', qr);
+                                    }
+                                }
+
+                                // Strategy 2: Biased classification (if still needed)
+                                const stillNeedQ3 = !colorScanResult.qr3 && needQ3;
+                                const stillNeedQ4 = !colorScanResult.qr4 && needQ4;
+                                if (stillNeedQ3 || stillNeedQ4) {
+                                    const t2s2 = decodeTargetedColorPair([
+                                        { data: t2Biased, inversionAttempts: 'dontInvert' },
+                                        { data: t2Biased, inversionAttempts: 'attemptBoth' }
+                                    ], tw, th, stillNeedQ3, stillNeedQ4);
+                                    if (t2s2 && t2s2.results) {
+                                        for (const qr of t2s2.results) {
+                                            assignColorPairResult(colorScanResult, 'qr3', 'qr4', qr);
+                                        }
                                     }
                                 }
                             }
