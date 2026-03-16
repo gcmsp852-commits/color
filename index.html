@@ -913,6 +913,7 @@
                 if (twin1Fast && twin1Fast.results) {
                     for (const qr of twin1Fast.results) {
                         assignColorPairResult(colorScanResult, 'qr1', 'qr2', qr);
+                        rememberColorReference(colorScanResult, mapQrResultToVideo(qr, plan));
                     }
                 }
                 if (twin1Fast && twin1Fast.bbox) {
@@ -929,6 +930,7 @@
                     if (twin1Fb && twin1Fb.results) {
                         for (const qr of twin1Fb.results) {
                             assignColorPairResult(colorScanResult, 'qr1', 'qr2', qr);
+                            rememberColorReference(colorScanResult, mapQrResultToVideo(qr, plan));
                         }
                     }
                     if (twin1Fb && twin1Fb.bbox) {
@@ -940,8 +942,11 @@
             // ★ Twin2はprocessColorQRTwinで処理（Twin1フォールバックも含む）
             const stillNeedTwin2 = !(colorScanResult.qr3 && colorScanResult.qr4);
             if (stillNeedTwin2) {
-                const colorDecoded = processColorQRTwin(frameData, plan.targetWidth, plan.targetHeight, colorScanResult);
+                const colorDecoded = processColorQRTwin(frameData, plan.targetWidth, plan.targetHeight, colorScanResult, plan);
                 if (colorDecoded) {
+                    if (colorDecoded._loc) {
+                        colorDecoded._loc = mapQrResultToVideo(colorDecoded._loc, plan);
+                    }
                     mergeColorScanResult(colorDecoded);
                     if (colorDecoded.bbox) {
                         localBBox = mergeBBox(localBBox, colorDecoded.bbox);
@@ -972,6 +977,9 @@
                 if (!colorScanResult[key] && nextResult[key]) {
                     colorScanResult[key] = nextResult[key];
                 }
+            }
+            if (nextResult._loc) {
+                colorScanResult._loc = nextResult._loc;
             }
             return colorScanResult;
         }
@@ -1294,6 +1302,37 @@
             };
         }
 
+        function transformQrResult(qr, scaleX, scaleY, offsetX, offsetY) {
+            if (!qr || !qr.location) return qr;
+            const movePoint = (point) => point ? ({ x: point.x * scaleX + offsetX, y: point.y * scaleY + offsetY }) : point;
+            return {
+                ...qr,
+                location: {
+                    ...qr.location,
+                    topLeftCorner: movePoint(qr.location.topLeftCorner),
+                    topRightCorner: movePoint(qr.location.topRightCorner),
+                    bottomRightCorner: movePoint(qr.location.bottomRightCorner),
+                    bottomLeftCorner: movePoint(qr.location.bottomLeftCorner),
+                    topLeftFinderPattern: movePoint(qr.location.topLeftFinderPattern),
+                    topRightFinderPattern: movePoint(qr.location.topRightFinderPattern),
+                    bottomLeftFinderPattern: movePoint(qr.location.bottomLeftFinderPattern),
+                    bottomRightAlignmentPattern: movePoint(qr.location.bottomRightAlignmentPattern)
+                }
+            };
+        }
+
+        function mapQrResultToVideo(qr, plan) {
+            if (!qr || !plan || !plan.targetWidth || !plan.targetHeight) return qr;
+            return transformQrResult(qr, plan.sw / plan.targetWidth, plan.sh / plan.targetHeight, plan.sx, plan.sy);
+        }
+
+        function mapQrResultFromVideo(qr, plan) {
+            if (!qr || !plan || !plan.sw || !plan.sh) return qr;
+            const scaleX = plan.targetWidth / plan.sw;
+            const scaleY = plan.targetHeight / plan.sh;
+            return transformQrResult(qr, scaleX, scaleY, -plan.sx * scaleX, -plan.sy * scaleY);
+        }
+
         function estimateModuleSizeFromQr(qr) {
             if (!qr || typeof qr.version !== 'number' || !qr.location) return null;
             const modules = 17 + 4 * qr.version;
@@ -1340,6 +1379,219 @@
             if (!res || !res.data) return null;
             if (acceptQr && !acceptQr(res)) return null;
             return res;
+        }
+
+        function rememberColorReference(target, qr) {
+            if (!target || !qr || typeof qr.version !== 'number' || !qr.location) return;
+            const copy = offsetQrResult(qr, 0, 0);
+            target._loc = {
+                version: copy.version,
+                managementCode: copy.managementCode,
+                location: copy.location
+            };
+        }
+
+        function decodeColorPairFromReference(scanPasses, width, height, referenceQr, needZero, needOne) {
+            const found = [];
+            let detectedBBox = null;
+            if (!referenceQr) return { results: found, bbox: detectedBBox };
+
+            const topBit = getColorPairTopBit(referenceQr);
+            const moduleSize = estimateModuleSizeFromQr(referenceQr);
+            if (topBit === null || !moduleSize) return { results: found, bbox: detectedBBox };
+
+            let stillNeedZero = !!needZero;
+            let stillNeedOne = !!needOne;
+            const shiftMultipliers = [8.5, 8.0, 9.0];
+
+            for (const mult of shiftMultipliers) {
+                if (!stillNeedZero && !stillNeedOne) break;
+                const shiftPx = Math.max(1, Math.round(moduleSize * mult));
+                if (shiftPx >= width || shiftPx >= height) continue;
+
+                if (stillNeedZero) {
+                    const offset = topBit === 0 ? 0 : -shiftPx;
+                    for (const scanPass of scanPasses) {
+                        const qr = decodeGuidedColorQr(scanPass, width, height, referenceQr, offset, offset, (item) => getColorPairTopBit(item) !== 1);
+                        if (qr) {
+                            found.push(qr);
+                            detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                            stillNeedZero = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (stillNeedOne) {
+                    const offset = topBit === 1 ? 0 : shiftPx;
+                    for (const scanPass of scanPasses) {
+                        const qr = decodeGuidedColorQr(scanPass, width, height, referenceQr, offset, offset, (item) => getColorPairTopBit(item) !== 0);
+                        if (qr) {
+                            found.push(qr);
+                            detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                            stillNeedOne = false;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return { results: found, bbox: detectedBBox };
+        }
+
+        function buildReferencePairCrop(referenceQr, width, height) {
+            if (!referenceQr) return null;
+            const topBit = getColorPairTopBit(referenceQr);
+            const moduleSize = estimateModuleSizeFromQr(referenceQr);
+            if (topBit === null || !moduleSize) return null;
+            const shiftPx = Math.max(1, Math.round(moduleSize * 8.5));
+            const pairOffset = topBit === 0 ? shiftPx : -shiftPx;
+            let pairBBox = mergeLocationBBox(null, referenceQr);
+            pairBBox = mergeLocationBBox(pairBBox, offsetQrResult(referenceQr, pairOffset, pairOffset));
+            const padding = Math.max(18, Math.round(moduleSize * 6));
+            return expandBBox(pairBBox, padding, width, height);
+        }
+
+        function buildColorTwinBuffers(src, pixelCount, needTwin1, needTwin2, profiles) {
+            const pBlackR = profiles.black.r, pBlackG = profiles.black.g, pBlackB = profiles.black.b;
+            const pDarkR = profiles.dark.r, pDarkG = profiles.dark.g, pDarkB = profiles.dark.b;
+            const pLightR = profiles.light.r, pLightG = profiles.light.g, pLightB = profiles.light.b;
+            const pWhiteR = profiles.white.r, pWhiteG = profiles.white.g, pWhiteB = profiles.white.b;
+            const isDarkBlack = colorEncDarkName === 'black';
+            const isLightWhite = colorEncLightName === 'white';
+            const isDarkRed = colorEncDarkName === 'red';
+            const isDarkBlue = colorEncDarkName === 'blue';
+            const isLightGreen = colorEncLightName === 'green';
+            const isLightYellow = colorEncLightName === 'yellow';
+
+            const twin1StrictData = needTwin1 ? new Uint8ClampedArray(pixelCount) : null;
+            const twin2StrictData = needTwin2 ? new Uint8ClampedArray(pixelCount) : null;
+            const twin2BiasedData = needTwin2 ? new Uint8ClampedArray(pixelCount) : null;
+
+            for (let i = 0; i < pixelCount; i++) {
+                const idx = i * 4;
+                const r = src[idx];
+                const g = src[idx + 1];
+                const b = src[idx + 2];
+
+                const maxRgb = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                const minRgb = r < g ? (r < b ? r : b) : (g < b ? g : b);
+                const chroma = maxRgb - minRgb;
+                const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                let strict;
+                let twin2Val;
+
+                if (luma <= 26 && chroma <= 46) {
+                    strict = 0;
+                    twin2Val = 0;
+                } else if (luma >= 238 && chroma <= 38) {
+                    strict = 3;
+                    twin2Val = 3;
+                } else {
+                    const blackScore = (r < pBlackR ? pBlackR - r : r - pBlackR) + (g < pBlackG ? pBlackG - g : g - pBlackG) + (b < pBlackB ? pBlackB - b : b - pBlackB) + luma + chroma * 0.18;
+                    let darkScore = (r < pDarkR ? pDarkR - r : r - pDarkR) + (g < pDarkG ? pDarkG - g : g - pDarkG) + (b < pDarkB ? pDarkB - b : b - pDarkB) + (40 - chroma > 0 ? (40 - chroma) * 1.25 : 0) + (luma - 225 > 0 ? (luma - 225) * 0.35 : 0);
+                    let lightScore = (r < pLightR ? pLightR - r : r - pLightR) + (g < pLightG ? pLightG - g : g - pLightG) + (b < pLightB ? pLightB - b : b - pLightB) + (34 - chroma > 0 ? (34 - chroma) * 1.05 : 0) + (92 - luma > 0 ? (92 - luma) * 0.45 : 0);
+                    const whiteScore = (r < pWhiteR ? pWhiteR - r : r - pWhiteR) + (g < pWhiteG ? pWhiteG - g : g - pWhiteG) + (b < pWhiteB ? pWhiteB - b : b - pWhiteB) + (255 - luma) + chroma * 0.12;
+
+                    if (chroma < 30) {
+                        darkScore += 28;
+                        lightScore += 18;
+                    }
+
+                    if (isDarkRed) {
+                        const dom = r - (g > b ? g : b);
+                        darkScore = dom > 0 ? darkScore - dom * 1.25 : darkScore + (-dom) * 0.12;
+                    } else if (isDarkBlue) {
+                        const dom = b - (r > g ? r : g);
+                        darkScore = dom > 0 ? darkScore - dom * 1.05 : darkScore + (-dom) * 0.12;
+                    }
+
+                    if (isLightGreen) {
+                        const dom = g - (r > b ? r : b);
+                        lightScore = dom > 0 ? lightScore - dom * 1.18 : lightScore + (-dom) * 0.12;
+                    } else if (isLightYellow) {
+                        const dom = (r < g ? r : g) - b;
+                        lightScore = dom > 0 ? lightScore - dom * 0.95 : lightScore + (-dom) * 0.12;
+                    }
+
+                    if (isDarkBlack) darkScore = blackScore + 2;
+                    if (isLightWhite) lightScore = whiteScore + 2;
+
+                    strict = 0;
+                    let bestScore = blackScore;
+                    if (darkScore < bestScore) {
+                        bestScore = darkScore;
+                        strict = 1;
+                    }
+                    if (lightScore < bestScore) {
+                        bestScore = lightScore;
+                        strict = 2;
+                    }
+                    if (whiteScore < bestScore) {
+                        strict = 3;
+                    }
+
+                    twin2Val = strict;
+                    if (strict === 0 && darkScore + 16 < blackScore) twin2Val = 1;
+                    else if (strict === 3 && lightScore + 16 < whiteScore) twin2Val = 2;
+                }
+
+                if (twin1StrictData) {
+                    twin1StrictData[i] = strict <= 1 ? 0 : 255;
+                }
+                if (twin2StrictData) {
+                    twin2StrictData[i] = (strict === 0 || strict === 2) ? 0 : 255;
+                    twin2BiasedData[i] = (twin2Val === 0 || twin2Val === 2) ? 0 : 255;
+                }
+            }
+
+            return { twin1StrictData, twin2StrictData, twin2BiasedData };
+        }
+
+        function decodeTwin2FromReferenceCrop(src, width, height, referenceQr, profiles, needZero, needOne) {
+            const found = new Map();
+            let detectedBBox = null;
+            if (!referenceQr || (!needZero && !needOne)) {
+                return { results: Array.from(found.values()), bbox: detectedBBox };
+            }
+
+            const cropBBox = buildReferencePairCrop(referenceQr, width, height);
+            if (!cropBBox) {
+                return { results: Array.from(found.values()), bbox: detectedBBox };
+            }
+
+            const crop = cropMonochromeRgbaImage(src, width, height, cropBBox.x, cropBBox.y, cropBBox.width, cropBBox.height);
+            const cropPixelCount = crop.width * crop.height;
+            const buffers = buildColorTwinBuffers(crop.data, cropPixelCount, false, true, profiles);
+            const cropReference = offsetQrResult(referenceQr, -crop.offsetX, -crop.offsetY);
+            let stillNeedZero = !!needZero;
+            let stillNeedOne = !!needOne;
+            const scanGroups = [
+                [{ data: buffers.twin2StrictData, inversionAttempts: 'dontInvert', preBinarized: true }],
+                [{ data: buffers.twin2BiasedData, inversionAttempts: 'dontInvert', preBinarized: true }],
+                [
+                    { data: buffers.twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true },
+                    { data: buffers.twin2BiasedData, inversionAttempts: 'attemptBoth', preBinarized: true }
+                ]
+            ];
+
+            for (const scanPasses of scanGroups) {
+                if (!stillNeedZero && !stillNeedOne) break;
+                const decoded = decodeColorPairFromReference(scanPasses, crop.width, crop.height, cropReference, stillNeedZero, stillNeedOne);
+                for (const qr of decoded.results) {
+                    const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
+                    const key = getColorResultKey(adjusted);
+                    if (found.has(key)) continue;
+                    found.set(key, adjusted);
+                    detectedBBox = mergeLocationBBox(detectedBBox, adjusted);
+                    const topBit = getColorPairTopBit(adjusted);
+                    if (topBit === 0) stillNeedZero = false;
+                    else if (topBit === 1) stillNeedOne = false;
+                }
+            }
+
+            return { results: Array.from(found.values()), bbox: detectedBBox };
         }
 
         function decodeSingleColorQr(scanPass, width, height, acceptQr = null) {
@@ -1557,148 +1809,107 @@
             });
         }
 
-        function processColorQRTwin(imageData, width, height, existingResult = null) {
-            const needTwin1 = !(existingResult && existingResult.qr1 && existingResult.qr2);
-            const needTwin2 = !(existingResult && existingResult.qr3 && existingResult.qr4);
-            if (!needTwin1 && !needTwin2) return null;
+        function processColorQRTwin(imageData, width, height, existingResult = null, plan = null) {
+            let needQr1 = !(existingResult && existingResult.qr1);
+            let needQr2 = !(existingResult && existingResult.qr2);
+            let needQr3 = !(existingResult && existingResult.qr3);
+            let needQr4 = !(existingResult && existingResult.qr4);
+            if (!needQr1 && !needQr2 && !needQr3 && !needQr4) return null;
 
             const src = imageData.data;
             const pixelCount = width * height;
             const profiles = getSelectedColorProfiles(colorEncDarkName, colorEncLightName);
+            const result = { qr1: null, qr2: null, qr3: null, qr4: null };
+            let detectedBBox = null;
+            let referenceQr = existingResult && existingResult._loc
+                ? (plan ? mapQrResultFromVideo(existingResult._loc, plan) : existingResult._loc)
+                : null;
 
-            const pBlackR = profiles.black.r, pBlackG = profiles.black.g, pBlackB = profiles.black.b;
-            const pDarkR = profiles.dark.r, pDarkG = profiles.dark.g, pDarkB = profiles.dark.b;
-            const pLightR = profiles.light.r, pLightG = profiles.light.g, pLightB = profiles.light.b;
-            const pWhiteR = profiles.white.r, pWhiteG = profiles.white.g, pWhiteB = profiles.white.b;
-            const isDarkBlack = colorEncDarkName === 'black';
-            const isLightWhite = colorEncLightName === 'white';
-            const isDarkRed = colorEncDarkName === 'red';
-            const isDarkBlue = colorEncDarkName === 'blue';
-            const isLightGreen = colorEncLightName === 'green';
-            const isLightYellow = colorEncLightName === 'yellow';
-
-            // ★ Twin1フォールバック用 + Twin2用のバッファ
-            const twin1StrictData = needTwin1 ? new Uint8ClampedArray(pixelCount) : null;
-            const twin2StrictData = needTwin2 ? new Uint8ClampedArray(pixelCount) : null;
-            const twin2BiasedData = needTwin2 ? new Uint8ClampedArray(pixelCount) : null;
-
-            for (let i = 0; i < pixelCount; i++) {
-                const idx = i * 4;
-                const r = src[idx];
-                const g = src[idx + 1];
-                const b = src[idx + 2];
-
-                const maxRgb = r > g ? (r > b ? r : b) : (g > b ? g : b);
-                const minRgb = r < g ? (r < b ? r : b) : (g < b ? g : b);
-                const chroma = maxRgb - minRgb;
-                const luma = 0.299 * r + 0.587 * g + 0.114 * b;
-
-                let strict, twin2Val;
-
-                if (luma <= 26 && chroma <= 46) {
-                    strict = 0;
-                    twin2Val = 0;
-                } else if (luma >= 238 && chroma <= 38) {
-                    strict = 3;
-                    twin2Val = 3;
-                } else {
-                    const blackScore = (r < pBlackR ? pBlackR - r : r - pBlackR) + (g < pBlackG ? pBlackG - g : g - pBlackG) + (b < pBlackB ? pBlackB - b : b - pBlackB) + luma + chroma * 0.18;
-                    let darkScore = (r < pDarkR ? pDarkR - r : r - pDarkR) + (g < pDarkG ? pDarkG - g : g - pDarkG) + (b < pDarkB ? pDarkB - b : b - pDarkB) + (40 - chroma > 0 ? (40 - chroma) * 1.25 : 0) + (luma - 225 > 0 ? (luma - 225) * 0.35 : 0);
-                    let lightScore = (r < pLightR ? pLightR - r : r - pLightR) + (g < pLightG ? pLightG - g : g - pLightG) + (b < pLightB ? pLightB - b : b - pLightB) + (34 - chroma > 0 ? (34 - chroma) * 1.05 : 0) + (92 - luma > 0 ? (92 - luma) * 0.45 : 0);
-                    const whiteScore = (r < pWhiteR ? pWhiteR - r : r - pWhiteR) + (g < pWhiteG ? pWhiteG - g : g - pWhiteG) + (b < pWhiteB ? pWhiteB - b : b - pWhiteB) + (255 - luma) + chroma * 0.12;
-
-                    if (chroma < 30) { darkScore += 28; lightScore += 18; }
-
-                    if (isDarkRed) {
-                        const dom = r - (g > b ? g : b);
-                        darkScore = dom > 0 ? darkScore - dom * 1.25 : darkScore + (-dom) * 0.12;
-                    } else if (isDarkBlue) {
-                        const dom = b - (r > g ? r : g);
-                        darkScore = dom > 0 ? darkScore - dom * 1.05 : darkScore + (-dom) * 0.12;
-                    }
-                    if (isLightGreen) {
-                        const dom = g - (r > b ? r : b);
-                        lightScore = dom > 0 ? lightScore - dom * 1.18 : lightScore + (-dom) * 0.12;
-                    } else if (isLightYellow) {
-                        const dom = (r < g ? r : g) - b;
-                        lightScore = dom > 0 ? lightScore - dom * 0.95 : lightScore + (-dom) * 0.12;
-                    }
-
-                    if (isDarkBlack) darkScore = blackScore + 2;
-                    if (isLightWhite) lightScore = whiteScore + 2;
-
-                    strict = 0;
-                    let bestScore = blackScore;
-                    if (darkScore < bestScore) { bestScore = darkScore; strict = 1; }
-                    if (lightScore < bestScore) { bestScore = lightScore; strict = 2; }
-                    if (whiteScore < bestScore) { strict = 3; }
-
-                    twin2Val = strict;
-                    if (strict === 0 && darkScore + 16 < blackScore) twin2Val = 1;
-                    else if (strict === 3 && lightScore + 16 < whiteScore) twin2Val = 2;
+            if ((needQr3 || needQr4) && referenceQr) {
+                const cropTwin2 = decodeTwin2FromReferenceCrop(src, width, height, referenceQr, profiles, needQr3, needQr4);
+                for (const qr of cropTwin2.results) {
+                    assignColorPairResult(result, 'qr3', 'qr4', qr);
+                    detectedBBox = mergeLocationBBox(detectedBBox, qr);
                 }
-
-                // Twin1: black(0) or dark(1) ??0, else 255
-                if (twin1StrictData) {
-                    twin1StrictData[i] = strict <= 1 ? 0 : 255;
-                }
-                // Twin2: black(0) or light(2) ??0, else 255
-                if (twin2StrictData) {
-                    twin2StrictData[i] = (strict === 0 || strict === 2) ? 0 : 255;
-                    twin2BiasedData[i] = (twin2Val === 0 || twin2Val === 2) ? 0 : 255;
+                needQr3 = needQr3 && !result.qr3;
+                needQr4 = needQr4 && !result.qr4;
+                if (cropTwin2.bbox) {
+                    detectedBBox = mergeBBox(detectedBBox, cropTwin2.bbox);
                 }
             }
 
-            const result = { qr1: null, qr2: null, qr3: null, qr4: null };
-            let detectedBBox = null;
+            if (!needQr1 && !needQr2 && !needQr3 && !needQr4) {
+                if (detectedBBox) result.bbox = detectedBBox;
+                return result;
+            }
 
-            // ★ Twin1 フォールバック（fast pathで見つからなかった場合のみ）
-            if (needTwin1) {
-                const needQr1 = !(existingResult && existingResult.qr1);
-                const needQr2 = !(existingResult && existingResult.qr2);
+            const buffers = buildColorTwinBuffers(src, pixelCount, needQr1 || needQr2, needQr3 || needQr4, profiles);
+
+            if (needQr1 || needQr2) {
                 const twin1Targeted = decodeTargetedColorPair([
-                    { data: twin1StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                    { data: buffers.twin1StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
                 ], width, height, needQr1, needQr2);
                 for (const qr of twin1Targeted.results) {
                     assignColorPairResult(result, 'qr1', 'qr2', qr);
+                    rememberColorReference(result, qr);
                     detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                }
+                needQr1 = needQr1 && !result.qr1;
+                needQr2 = needQr2 && !result.qr2;
+                if (result._loc) {
+                    referenceQr = result._loc;
                 }
             }
 
-            // Twin2 strict
-            if (needTwin2) {
-                const needQr3 = !(existingResult && existingResult.qr3);
-                const needQr4 = !(existingResult && existingResult.qr4);
+            if ((needQr3 || needQr4) && referenceQr) {
+                const guidedScanGroups = [
+                    [{ data: buffers.twin2StrictData, inversionAttempts: 'dontInvert', preBinarized: true }],
+                    [{ data: buffers.twin2BiasedData, inversionAttempts: 'dontInvert', preBinarized: true }],
+                    [
+                        { data: buffers.twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true },
+                        { data: buffers.twin2BiasedData, inversionAttempts: 'attemptBoth', preBinarized: true }
+                    ]
+                ];
+                for (const scanPasses of guidedScanGroups) {
+                    if (!needQr3 && !needQr4) break;
+                    const guidedTwin2 = decodeColorPairFromReference(scanPasses, width, height, referenceQr, needQr3, needQr4);
+                    for (const qr of guidedTwin2.results) {
+                        assignColorPairResult(result, 'qr3', 'qr4', qr);
+                        detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                    }
+                    needQr3 = needQr3 && !result.qr3;
+                    needQr4 = needQr4 && !result.qr4;
+                }
+            }
 
+            if (needQr3 || needQr4) {
                 const twin2Targeted = decodeTargetedColorPair([
-                    { data: twin2StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                    { data: buffers.twin2StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
                 ], width, height, needQr3, needQr4);
                 for (const qr of twin2Targeted.results) {
                     assignColorPairResult(result, 'qr3', 'qr4', qr);
                     detectedBBox = mergeLocationBBox(detectedBBox, qr);
                 }
+                needQr3 = needQr3 && !result.qr3;
+                needQr4 = needQr4 && !result.qr4;
 
-                // Twin2 biased フォールバック
-                const needBiasedQr3 = needQr3 && !result.qr3;
-                const needBiasedQr4 = needQr4 && !result.qr4;
-                if (needBiasedQr3 || needBiasedQr4) {
+                if (needQr3 || needQr4) {
                     const twin2BiasedTargeted = decodeTargetedColorPair([
-                        { data: twin2BiasedData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
-                    ], width, height, needBiasedQr3, needBiasedQr4);
+                        { data: buffers.twin2BiasedData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                    ], width, height, needQr3, needQr4);
                     for (const qr of twin2BiasedTargeted.results) {
                         assignColorPairResult(result, 'qr3', 'qr4', qr);
                         detectedBBox = mergeLocationBBox(detectedBBox, qr);
                     }
+                    needQr3 = needQr3 && !result.qr3;
+                    needQr4 = needQr4 && !result.qr4;
                 }
 
-                // ★ Ver5精度向上: strict+biasedで見つからなかった場合、attemptBothで両データを再試行
-                const retryQr3 = needQr3 && !result.qr3;
-                const retryQr4 = needQr4 && !result.qr4;
-                if (retryQr3 || retryQr4) {
+                if (needQr3 || needQr4) {
                     const twin2Retry = decodeTargetedColorPair([
-                        { data: twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true },
-                        { data: twin2BiasedData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
-                    ], width, height, retryQr3, retryQr4);
+                        { data: buffers.twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true },
+                        { data: buffers.twin2BiasedData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
+                    ], width, height, needQr3, needQr4);
                     for (const qr of twin2Retry.results) {
                         assignColorPairResult(result, 'qr3', 'qr4', qr);
                         detectedBBox = mergeLocationBBox(detectedBBox, qr);
