@@ -354,9 +354,9 @@ function buildBitMatrixFromBinary(data, width, height, returnInverted) {
 }
 function scan(matrix, options) {
     var locations = locator_1.locate(matrix, options);
-    // ★ 高速化: singleLocate では候補を最小限に絞る
-    if (locations && options && options.singleLocate && !options.multi && locations.length > 1) {
-        locations = locations.slice(0, 1);
+    // ★ singleLocate では候補を絞る（ただし精度確保のため2つまで許可）
+    if (locations && options && options.singleLocate && !options.multi && locations.length > 2) {
+        locations = locations.slice(0, 2);
     }
     if (!locations)
         return null;
@@ -10000,11 +10000,11 @@ function scorePattern(point, ratios, matrix) {
     try {
         var horizontalRun = countBlackWhiteRun(point, { x: -1, y: point.y }, matrix, ratios.length);
         var horzError = scoreBlackWhiteRun(horizontalRun, ratios);
-        // ★ 高速化: 水平方向だけで明らかに悪い候補は早期棄却
-        if (horzError.error > 100) return Infinity;
+        // ★ 水平方向だけで明らかに悪い候補は早期棄却（閾値は緩めに設定）
+        if (horzError.error > 500) return Infinity;
         var verticalRun = countBlackWhiteRun(point, { x: point.x, y: -1 }, matrix, ratios.length);
         var vertError = scoreBlackWhiteRun(verticalRun, ratios);
-        if (horzError.error + vertError.error > 200) return Infinity;
+        if (horzError.error + vertError.error > 800) return Infinity;
         var topLeftPoint = { x: Math.max(0, point.x - point.y) - 1, y: Math.max(0, point.y - point.x) - 1 };
         var topLeftBottomRightRun = countBlackWhiteRun(point, topLeftPoint, matrix, ratios.length);
         var bottomLeftPoint = { x: Math.min(matrix.width, point.x + point.y) + 1, y: Math.min(matrix.height, point.y + point.x) + 1 };
@@ -10046,8 +10046,8 @@ function locate(matrix, options) {
     var activeFinderPatternQuads = [];
     var alignmentPatternQuads = [];
     var activeAlignmentPatternQuads = [];
-    // ★ 高速化: 大きな画像では行をスキップ（ファインダーパターンは十分大きいため検出漏れなし）
-    var yStep = (matrix.height > 300 && options && options.singleLocate) ? 2 : 1;
+    // ★ 高速化: 非常に大きな画像のみ行スキップ（精度優先）
+    var yStep = (matrix.height > 500 && options && options.singleLocate) ? 2 : 1;
     var matrixData = matrix.data;
     var matrixWidth = matrix.width;
     var _loop_1 = function (y) {
@@ -10204,24 +10204,23 @@ function locate(matrix, options) {
                 topLeft: { x: topLeft.x, y: topLeft.y },
                 topRight: { x: topRight.x, y: topRight.y },
             });
-            // ★ 高速化: singleLocate では最初に見つかったら即終了
-            if (isSingle) break;
+            // ★ singleLocate: 2つ見つかったら十分
+            if (isSingle && result.length >= 2) break;
         }
-        // ★ 高速化: singleLocate ではrecenter+再検索をスキップ（処理コスト半減）
-        if (!isSingle) {
-            var midTopRight = recenterLocation(matrix, topRight);
-            var midTopLeft = recenterLocation(matrix, topLeft);
-            var midBottomLeft = recenterLocation(matrix, bottomLeft);
-            var centeredAlignment = findAlignmentPattern(matrix, alignmentPatternQuads, midTopRight, midTopLeft, midBottomLeft);
-            if (centeredAlignment) {
-                result.push({
-                    alignmentPattern: { x: centeredAlignment.alignmentPattern.x, y: centeredAlignment.alignmentPattern.y },
-                    bottomLeft: { x: midBottomLeft.x, y: midBottomLeft.y },
-                    dimension: centeredAlignment.dimension,
-                    topLeft: { x: midTopLeft.x, y: midTopLeft.y },
-                    topRight: { x: midTopRight.x, y: midTopRight.y },
-                });
-            }
+        // ★ recenter は精度に重要なので常に実行（Ver5等の高バージョンで効果大）
+        var midTopRight = recenterLocation(matrix, topRight);
+        var midTopLeft = recenterLocation(matrix, topLeft);
+        var midBottomLeft = recenterLocation(matrix, bottomLeft);
+        var centeredAlignment = findAlignmentPattern(matrix, alignmentPatternQuads, midTopRight, midTopLeft, midBottomLeft);
+        if (centeredAlignment) {
+            result.push({
+                alignmentPattern: { x: centeredAlignment.alignmentPattern.x, y: centeredAlignment.alignmentPattern.y },
+                bottomLeft: { x: midBottomLeft.x, y: midBottomLeft.y },
+                dimension: centeredAlignment.dimension,
+                topLeft: { x: midTopLeft.x, y: midTopLeft.y },
+                topRight: { x: midTopRight.x, y: midTopRight.y },
+            });
+            if (isSingle && result.length >= 2) break;
         }
     }
     if (result.length === 0) {

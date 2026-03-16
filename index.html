@@ -826,8 +826,8 @@
                 : COLOR_BBOX_PADDING;
         }
 
-        // ★ 高速化: focused plan の最大解像度をキャップ（大きなBBoxでもピクセル爆発を防止）
-        const COLOR_FOCUSED_CAP_DIM = 640;
+        // ★ focused plan の最大解像度キャップ（精度とのバランス）
+        const COLOR_FOCUSED_CAP_DIM = 720;
         function buildColorFocusedPlan(videoWidth, videoHeight, maxDim = 0) {
             if (!colorScanBBox) return null;
             const focusedBBox = expandBBox(colorScanBBox, getColorFocusPadding(colorScanBBox), videoWidth, videoHeight);
@@ -904,15 +904,11 @@
             const needQ1 = !colorScanResult.qr1;
             const needQ2 = !colorScanResult.qr2;
             if (needQ1 || needQ2) {
-                // ★ 高速化: 事前二値化でjsQRのbinarizerを完全スキップ
-                const twin1Bin = buildChannelBinarizedRgba(
-                    frameData.data,
-                    pixelCount,
-                    getTwin1ChannelIndex(colorEncDarkName, colorEncLightName),
-                    128
-                );
+                const chIdx = getTwin1ChannelIndex(colorEncDarkName, colorEncLightName);
+                // ★ まず適応的二値化（jsQRのbinarizer）で試行 → 照明ムラに強い
+                const twin1Mono = buildChannelMonochromeRgba(frameData.data, pixelCount, chIdx);
                 const twin1Fast = decodeTargetedColorPair([
-                    { data: twin1Bin, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                    { data: twin1Mono, inversionAttempts: 'dontInvert', singleLocate: true }
                 ], plan.targetWidth, plan.targetHeight, needQ1, needQ2);
                 if (twin1Fast && twin1Fast.results) {
                     for (const qr of twin1Fast.results) {
@@ -922,12 +918,28 @@
                 if (twin1Fast && twin1Fast.bbox) {
                     localBBox = mergeBBox(localBBox, twin1Fast.bbox);
                 }
+                // ★ 適応的で見つからなかった分は固定閾値二値化でフォールバック
+                const fallbackQ1 = !colorScanResult.qr1;
+                const fallbackQ2 = !colorScanResult.qr2;
+                if (fallbackQ1 || fallbackQ2) {
+                    const twin1Bin = buildChannelBinarizedRgba(frameData.data, pixelCount, chIdx, 128);
+                    const twin1Fb = decodeTargetedColorPair([
+                        { data: twin1Bin, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                    ], plan.targetWidth, plan.targetHeight, fallbackQ1, fallbackQ2);
+                    if (twin1Fb && twin1Fb.results) {
+                        for (const qr of twin1Fb.results) {
+                            assignColorPairResult(colorScanResult, 'qr1', 'qr2', qr);
+                        }
+                    }
+                    if (twin1Fb && twin1Fb.bbox) {
+                        localBBox = mergeBBox(localBBox, twin1Fb.bbox);
+                    }
+                }
             }
 
-            // ★ 高速化: Twin1が両方見つかっていてTwin2も不要なら processColorQRTwin をスキップ
-            const stillNeedTwin1 = !(colorScanResult.qr1 && colorScanResult.qr2);
+            // ★ Twin2はprocessColorQRTwinで処理（Twin1フォールバックも含む）
             const stillNeedTwin2 = !(colorScanResult.qr3 && colorScanResult.qr4);
-            if (stillNeedTwin1 || stillNeedTwin2) {
+            if (stillNeedTwin2) {
                 const colorDecoded = processColorQRTwin(frameData, plan.targetWidth, plan.targetHeight, colorScanResult);
                 if (colorDecoded) {
                     mergeColorScanResult(colorDecoded);
@@ -1429,9 +1441,9 @@
         }
 
         function processColorQRTwin(imageData, width, height, existingResult = null) {
-            // ★ 高速化: Twin1はfast path(チャンネル二値化)で処理済み → Twin2のみ処理
+            const needTwin1 = !(existingResult && existingResult.qr1 && existingResult.qr2);
             const needTwin2 = !(existingResult && existingResult.qr3 && existingResult.qr4);
-            if (!needTwin2) return null;
+            if (!needTwin1 && !needTwin2) return null;
 
             const src = imageData.data;
             const pixelCount = width * height;
@@ -1448,9 +1460,10 @@
             const isLightGreen = colorEncLightName === 'green';
             const isLightYellow = colorEncLightName === 'yellow';
 
-            // ★ Twin2 のみアロケーション（Twin1 は不要）
-            const twin2StrictData = new Uint8ClampedArray(pixelCount * 4);
-            const twin2BiasedData = new Uint8ClampedArray(pixelCount * 4);
+            // ★ Twin1フォールバック用 + Twin2用のバッファ
+            const twin1StrictData = needTwin1 ? new Uint8ClampedArray(pixelCount * 4) : null;
+            const twin2StrictData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
+            const twin2BiasedData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
 
             for (let i = 0; i < pixelCount; i++) {
                 const idx = i * 4;
@@ -1508,43 +1521,82 @@
                     else if (strict === 3 && lightScore + 16 < whiteScore) twin2Val = 2;
                 }
 
+                // Twin1: black(0) or dark(1) → 0, else 255
+                if (twin1StrictData) {
+                    const v1 = strict <= 1 ? 0 : 255;
+                    twin1StrictData[idx] = v1;
+                    twin1StrictData[idx + 1] = v1;
+                    twin1StrictData[idx + 2] = v1;
+                    twin1StrictData[idx + 3] = 255;
+                }
                 // Twin2: black(0) or light(2) → 0, else 255
-                const vs = (strict === 0 || strict === 2) ? 0 : 255;
-                twin2StrictData[idx] = vs;
-                twin2StrictData[idx + 1] = vs;
-                twin2StrictData[idx + 2] = vs;
-                twin2StrictData[idx + 3] = 255;
-                const vb = (twin2Val === 0 || twin2Val === 2) ? 0 : 255;
-                twin2BiasedData[idx] = vb;
-                twin2BiasedData[idx + 1] = vb;
-                twin2BiasedData[idx + 2] = vb;
-                twin2BiasedData[idx + 3] = 255;
+                if (twin2StrictData) {
+                    const vs = (strict === 0 || strict === 2) ? 0 : 255;
+                    twin2StrictData[idx] = vs;
+                    twin2StrictData[idx + 1] = vs;
+                    twin2StrictData[idx + 2] = vs;
+                    twin2StrictData[idx + 3] = 255;
+                    const vb = (twin2Val === 0 || twin2Val === 2) ? 0 : 255;
+                    twin2BiasedData[idx] = vb;
+                    twin2BiasedData[idx + 1] = vb;
+                    twin2BiasedData[idx + 2] = vb;
+                    twin2BiasedData[idx + 3] = 255;
+                }
             }
 
             const result = { qr1: null, qr2: null, qr3: null, qr4: null };
             let detectedBBox = null;
 
-            const needQr3 = !(existingResult && existingResult.qr3);
-            const needQr4 = !(existingResult && existingResult.qr4);
-
-            // ★ 高速化: preBinarized では dontInvert のみ（attemptBoth 廃止）
-            const twin2Targeted = decodeTargetedColorPair([
-                { data: twin2StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
-            ], width, height, needQr3, needQr4);
-            for (const qr of twin2Targeted.results) {
-                assignColorPairResult(result, 'qr3', 'qr4', qr);
-                detectedBBox = mergeLocationBBox(detectedBBox, qr);
+            // ★ Twin1 フォールバック（fast pathで見つからなかった場合のみ）
+            if (needTwin1) {
+                const needQr1 = !(existingResult && existingResult.qr1);
+                const needQr2 = !(existingResult && existingResult.qr2);
+                const twin1Targeted = decodeTargetedColorPair([
+                    { data: twin1StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                ], width, height, needQr1, needQr2);
+                for (const qr of twin1Targeted.results) {
+                    assignColorPairResult(result, 'qr1', 'qr2', qr);
+                    detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                }
             }
 
-            const needBiasedQr3 = needQr3 && !result.qr3;
-            const needBiasedQr4 = needQr4 && !result.qr4;
-            if (needBiasedQr3 || needBiasedQr4) {
-                const twin2BiasedTargeted = decodeTargetedColorPair([
-                    { data: twin2BiasedData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
-                ], width, height, needBiasedQr3, needBiasedQr4);
-                for (const qr of twin2BiasedTargeted.results) {
+            // Twin2 strict
+            if (needTwin2) {
+                const needQr3 = !(existingResult && existingResult.qr3);
+                const needQr4 = !(existingResult && existingResult.qr4);
+
+                const twin2Targeted = decodeTargetedColorPair([
+                    { data: twin2StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                ], width, height, needQr3, needQr4);
+                for (const qr of twin2Targeted.results) {
                     assignColorPairResult(result, 'qr3', 'qr4', qr);
                     detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                }
+
+                // Twin2 biased フォールバック
+                const needBiasedQr3 = needQr3 && !result.qr3;
+                const needBiasedQr4 = needQr4 && !result.qr4;
+                if (needBiasedQr3 || needBiasedQr4) {
+                    const twin2BiasedTargeted = decodeTargetedColorPair([
+                        { data: twin2BiasedData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true }
+                    ], width, height, needBiasedQr3, needBiasedQr4);
+                    for (const qr of twin2BiasedTargeted.results) {
+                        assignColorPairResult(result, 'qr3', 'qr4', qr);
+                        detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                    }
+                }
+
+                // ★ Ver5精度向上: strict+biasedで見つからなかった場合、attemptBothで再試行
+                const retryQr3 = needQr3 && !result.qr3;
+                const retryQr4 = needQr4 && !result.qr4;
+                if (retryQr3 || retryQr4) {
+                    const twin2Retry = decodeTargetedColorPair([
+                        { data: twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
+                    ], width, height, retryQr3, retryQr4);
+                    for (const qr of twin2Retry.results) {
+                        assignColorPairResult(result, 'qr3', 'qr4', qr);
+                        detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                    }
                 }
             }
 
