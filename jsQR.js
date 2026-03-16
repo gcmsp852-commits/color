@@ -492,6 +492,20 @@ jsQR.decodeAtLocation = function (data, width, height, location, providedOptions
     }
     return result;
 };
+jsQR.decodeBinaryMatrix = function (data, width, height, providedOptions) {
+    var options = buildJsQROptions(providedOptions);
+    var matrix = data && typeof data.get === "function" && typeof data.set === "function"
+        ? data
+        : (function () {
+            var built = BitMatrix_1.BitMatrix.createEmpty(width, height);
+            var total = width * height;
+            for (var i = 0; i < total; i++) {
+                built.data[i] = data[i] ? 1 : 0;
+            }
+            return built;
+        })();
+    return decoder_1.decode(matrix, options);
+};
 jsQR.resumeDecode = function (rawData, appMask) {
     if (!rawData)
         return null;
