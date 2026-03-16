@@ -332,12 +332,29 @@ var __assign = (this && this.__assign) || Object.assign || function(t) {
     return t;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+var BitMatrix_1 = __webpack_require__(0);
 var binarizer_1 = __webpack_require__(4);
 var decoder_1 = __webpack_require__(5);
 var extractor_1 = __webpack_require__(11);
 var locator_1 = __webpack_require__(12);
+function buildBitMatrixFromBinary(data, width, height, returnInverted) {
+    var binarized = BitMatrix_1.BitMatrix.createEmpty(width, height);
+    var inverted = returnInverted ? BitMatrix_1.BitMatrix.createEmpty(width, height) : null;
+    var isSingleChannel = data.length === width * height;
+    for (var i = 0, offset = 0; i < width * height; i++, offset += isSingleChannel ? 1 : 4) {
+        var bit = data[offset] < 128;
+        binarized.data[i] = bit ? 1 : 0;
+        if (returnInverted) {
+            inverted.data[i] = bit ? 0 : 1;
+        }
+    }
+    return { binarized: binarized, inverted: inverted };
+}
 function scan(matrix, options) {
-    var locations = locator_1.locate(matrix);
+    var locations = locator_1.locate(matrix, options);
+    if (locations && options && options.singleLocate && !options.multi && locations.length > 3) {
+        locations = locations.slice(0, 3);
+    }
     if (!locations)
         return null;
     var results = []; // ★ 追加：結果を格納する配列
@@ -417,11 +434,13 @@ function jsQR(data, width, height, providedOptions) {
         extractRawOnly: providedOptions.extractRawOnly,
         multi: providedOptions.multi,
         extractRawForFailed: providedOptions.extractRawForFailed,
-        sysEncDecode: providedOptions.sysEncDecode
+        sysEncDecode: providedOptions.sysEncDecode,
+        preBinarized: providedOptions.preBinarized,
+        singleLocate: providedOptions.singleLocate
     };
     var shouldInvert = options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst";
     var tryInvertedFirst = options.inversionAttempts === "onlyInvert" || options.inversionAttempts === "invertFirst";
-    var _a = binarizer_1.binarize(data, width, height, shouldInvert), binarized = _a.binarized, inverted = _a.inverted;
+    var _a = options.preBinarized ? buildBitMatrixFromBinary(data, width, height, shouldInvert) : binarizer_1.binarize(data, width, height, shouldInvert), binarized = _a.binarized, inverted = _a.inverted;
     var result = scan(tryInvertedFirst ? inverted : binarized, options);
     // ★ multiモード時の両面スキャン統合ロジック
     if (options.multi) {
@@ -10013,7 +10032,7 @@ function recenterLocation(matrix, p) {
     var y = (topY + bottomY) / 2;
     return { x: x, y: y };
 }
-function locate(matrix) {
+function locate(matrix, options) {
     var finderPatternQuads = [];
     var activeFinderPatternQuads = [];
     var alignmentPatternQuads = [];
@@ -10091,7 +10110,8 @@ function locate(matrix) {
     // ★ 改良点：QRツインの密集したマーク群から、正しい3つだけを幾何学的に抽出する
     // ▼▼ src/locator/index.ts の下部を上書き ▼▼
     // ★ 候補を少し増やして、見落としを防ぐ
-    var topFinderPatterns = validFinderPatterns.slice(0, 20);
+    var maxFinderPatterns = options && options.singleLocate ? 8 : 20;
+    var topFinderPatterns = validFinderPatterns.slice(0, maxFinderPatterns);
     var finderPatternGroups = [];
     var len = topFinderPatterns.length;
     for (var i = 0; i < len - 2; i++) {
@@ -10133,7 +10153,8 @@ function locate(matrix) {
     }
     var result = [];
     // ★ 歪んだQRも拾えるように、処理に回すグループ数を増やす（6 -> 10）
-    var groupsToProcess = finderPatternGroups.slice(0, 10);
+    var maxGroups = options && options.singleLocate ? 3 : 10;
+    var groupsToProcess = finderPatternGroups.slice(0, maxGroups);
     for (var _i = 0, groupsToProcess_1 = groupsToProcess; _i < groupsToProcess_1.length; _i++) {
         var group = groupsToProcess_1[_i];
         var _b = reorderFinderPatterns(group.points[0], group.points[1], group.points[2]), topRight = _b.topRight, topLeft = _b.topLeft, bottomLeft = _b.bottomLeft;

@@ -826,13 +826,13 @@
                 : COLOR_BBOX_PADDING;
         }
 
-        function buildColorFocusedPlan(videoWidth, videoHeight, maxDim = COLOR_FOCUS_MAX_DIM) {
+        function buildColorFocusedPlan(videoWidth, videoHeight, maxDim = 0) {
             if (!colorScanBBox) return null;
             const focusedBBox = expandBBox(colorScanBBox, getColorFocusPadding(colorScanBBox), videoWidth, videoHeight);
             if (!focusedBBox) return null;
             const sw = Math.max(1, Math.ceil(focusedBBox.width));
             const sh = Math.max(1, Math.ceil(focusedBBox.height));
-            const scale = Math.min(1, maxDim / Math.max(sw, sh));
+            const scale = maxDim > 0 ? Math.min(1, maxDim / Math.max(sw, sh)) : 1;
 
             return {
                 sx: Math.floor(focusedBBox.x),
@@ -846,7 +846,7 @@
 
         function buildColorScanPlan(videoWidth, videoHeight) {
             const refreshFullFrame = colorScanAttemptCount > 0 && (colorScanAttemptCount % COLOR_FOCUS_REFRESH_EVERY === 0);
-            const focusedPlan = !refreshFullFrame ? buildColorFocusedPlan(videoWidth, videoHeight) : null;
+            const focusedPlan = !refreshFullFrame ? buildColorFocusedPlan(videoWidth, videoHeight, 0) : null;
             const useFullFrameFallback = !focusedPlan && (colorScanAttemptCount % COLOR_FULL_SCAN_EVERY === 0);
 
             if (focusedPlan) return focusedPlan;
@@ -906,8 +906,8 @@
                     getTwin1ChannelIndex(colorEncDarkName, colorEncLightName)
                 );
                 const twin1Fast = decodeTargetedColorPair([
-                    { data: twin1Mono, inversionAttempts: 'dontInvert' },
-                    { data: twin1Mono, inversionAttempts: 'attemptBoth' }
+                    { data: twin1Mono, inversionAttempts: 'dontInvert', singleLocate: true },
+                    { data: twin1Mono, inversionAttempts: 'attemptBoth', singleLocate: true }
                 ], plan.targetWidth, plan.targetHeight, needQ1, needQ2);
                 if (twin1Fast && twin1Fast.results) {
                     for (const qr of twin1Fast.results) {
@@ -1284,7 +1284,9 @@
             if (!scanPass || !scanPass.data) return null;
             const res = jsQR(scanPass.data, width, height, {
                 inversionAttempts: scanPass.inversionAttempts || 'attemptBoth',
-                multi: false
+                multi: false,
+                preBinarized: !!scanPass.preBinarized,
+                singleLocate: scanPass.singleLocate !== false
             });
             if (!res || !res.data) return null;
             if (acceptQr && !acceptQr(res)) return null;
@@ -1324,7 +1326,12 @@
             if (needZero) {
                 const scanPass = scanPasses[0];
                 const crop = cropMonochromeRgbaImage(scanPass.data, width, height, 0, 0, cropWidth, cropHeight);
-                const qr = decodeSingleColorQr(crop, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 1);
+                const qr = decodeSingleColorQr({
+                    data: crop.data,
+                    inversionAttempts: scanPass.inversionAttempts,
+                    preBinarized: scanPass.preBinarized,
+                    singleLocate: scanPass.singleLocate
+                }, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 1);
                 if (qr) {
                     const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
                     const key = getColorResultKey(adjusted);
@@ -1338,7 +1345,12 @@
             if (needOne) {
                 const scanPass = scanPasses[0];
                 const crop = cropMonochromeRgbaImage(scanPass.data, width, height, shiftPx, shiftPx, cropWidth, cropHeight);
-                const qr = decodeSingleColorQr(crop, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 0);
+                const qr = decodeSingleColorQr({
+                    data: crop.data,
+                    inversionAttempts: scanPass.inversionAttempts,
+                    preBinarized: scanPass.preBinarized,
+                    singleLocate: scanPass.singleLocate
+                }, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 0);
                 if (qr) {
                     const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
                     const key = getColorResultKey(adjusted);
@@ -1428,8 +1440,8 @@
 
             if (needTwin1) {
                 const twin1Targeted = decodeTargetedColorPair([
-                    { data: twin1StrictData, inversionAttempts: 'dontInvert' },
-                    { data: twin1StrictData, inversionAttempts: 'attemptBoth' }
+                    { data: twin1StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true },
+                    { data: twin1StrictData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
                 ], width, height, needQr1, needQr2);
                 for (const qr of twin1Targeted.results) {
                     assignColorPairResult(result, 'qr1', 'qr2', qr);
@@ -1439,8 +1451,8 @@
 
             if (needTwin2) {
                 const twin2Targeted = decodeTargetedColorPair([
-                    { data: twin2StrictData, inversionAttempts: 'dontInvert' },
-                    { data: twin2StrictData, inversionAttempts: 'attemptBoth' }
+                    { data: twin2StrictData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true },
+                    { data: twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
                 ], width, height, needQr3, needQr4);
                 for (const qr of twin2Targeted.results) {
                     assignColorPairResult(result, 'qr3', 'qr4', qr);
@@ -1451,8 +1463,8 @@
                 const needBiasedQr4 = needQr4 && !result.qr4;
                 if (needBiasedQr3 || needBiasedQr4) {
                     const twin2BiasedTargeted = decodeTargetedColorPair([
-                        { data: twin2BiasedData, inversionAttempts: 'dontInvert' },
-                        { data: twin2BiasedData, inversionAttempts: 'attemptBoth' }
+                        { data: twin2BiasedData, inversionAttempts: 'dontInvert', preBinarized: true, singleLocate: true },
+                        { data: twin2BiasedData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
                     ], width, height, needBiasedQr3, needBiasedQr4);
                     for (const qr of twin2BiasedTargeted.results) {
                         assignColorPairResult(result, 'qr3', 'qr4', qr);
