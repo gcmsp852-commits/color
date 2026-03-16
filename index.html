@@ -1215,15 +1215,10 @@
 
         // ★ 高速化: チャンネル抽出 → 即座に二値化（jsQRのbinarizerをスキップ可能）
         function buildChannelBinarizedRgba(src, pixelCount, channelIndex, threshold) {
-            const out = new Uint8ClampedArray(pixelCount * 4);
-            const len4 = pixelCount * 4;
+            const out = new Uint8ClampedArray(pixelCount);
             const thr = threshold || 128;
-            for (let idx = 0; idx < len4; idx += 4) {
-                const v = src[idx + channelIndex] < thr ? 0 : 255;
-                out[idx] = v;
-                out[idx + 1] = v;
-                out[idx + 2] = v;
-                out[idx + 3] = 255;
+            for (let i = 0, idx = channelIndex; i < pixelCount; i++, idx += 4) {
+                out[i] = src[idx] < thr ? 0 : 255;
             }
             return out;
         }
@@ -1266,14 +1261,14 @@
             const startY = Math.max(0, Math.min(height - 1, Math.round(sy)));
             const outWidth = Math.max(1, Math.min(width - startX, Math.round(cropWidth)));
             const outHeight = Math.max(1, Math.min(height - startY, Math.round(cropHeight)));
-            const outLen = outWidth * outHeight * 4;
+            const bytesPerPixel = src.length === width * height ? 1 : 4;
+            const outLen = outWidth * outHeight * bytesPerPixel;
             const out = new Uint8ClampedArray(outLen);
-            // ★ 高速化: fill(255)で一括初期化 → subarray copyで上書き
             out.fill(255);
 
-            const rowBytes = outWidth * 4;
+            const rowBytes = outWidth * bytesPerPixel;
             for (let y = 0; y < outHeight; y++) {
-                const srcStart = ((startY + y) * width + startX) * 4;
+                const srcStart = ((startY + y) * width + startX) * bytesPerPixel;
                 out.set(src.subarray(srcStart, srcStart + rowBytes), y * rowBytes);
             }
 
@@ -1352,7 +1347,7 @@
                     inversionAttempts: scanPass.inversionAttempts || 'dontInvert',
                     multi: true,
                     preBinarized: !!scanPass.preBinarized,
-                    singleLocate: false
+                    singleLocate: scanPass.singleLocate !== false
                 });
                 if (multiRes) {
                     const items = Array.isArray(multiRes) ? multiRes : [multiRes];
@@ -1519,9 +1514,9 @@
             const isLightYellow = colorEncLightName === 'yellow';
 
             // ★ Twin1フォールバック用 + Twin2用のバッファ
-            const twin1StrictData = needTwin1 ? new Uint8ClampedArray(pixelCount * 4) : null;
-            const twin2StrictData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
-            const twin2BiasedData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
+            const twin1StrictData = needTwin1 ? new Uint8ClampedArray(pixelCount) : null;
+            const twin2StrictData = needTwin2 ? new Uint8ClampedArray(pixelCount) : null;
+            const twin2BiasedData = needTwin2 ? new Uint8ClampedArray(pixelCount) : null;
 
             for (let i = 0; i < pixelCount; i++) {
                 const idx = i * 4;
@@ -1579,26 +1574,14 @@
                     else if (strict === 3 && lightScore + 16 < whiteScore) twin2Val = 2;
                 }
 
-                // Twin1: black(0) or dark(1) → 0, else 255
+                // Twin1: black(0) or dark(1) ??0, else 255
                 if (twin1StrictData) {
-                    const v1 = strict <= 1 ? 0 : 255;
-                    twin1StrictData[idx] = v1;
-                    twin1StrictData[idx + 1] = v1;
-                    twin1StrictData[idx + 2] = v1;
-                    twin1StrictData[idx + 3] = 255;
+                    twin1StrictData[i] = strict <= 1 ? 0 : 255;
                 }
-                // Twin2: black(0) or light(2) → 0, else 255
+                // Twin2: black(0) or light(2) ??0, else 255
                 if (twin2StrictData) {
-                    const vs = (strict === 0 || strict === 2) ? 0 : 255;
-                    twin2StrictData[idx] = vs;
-                    twin2StrictData[idx + 1] = vs;
-                    twin2StrictData[idx + 2] = vs;
-                    twin2StrictData[idx + 3] = 255;
-                    const vb = (twin2Val === 0 || twin2Val === 2) ? 0 : 255;
-                    twin2BiasedData[idx] = vb;
-                    twin2BiasedData[idx + 1] = vb;
-                    twin2BiasedData[idx + 2] = vb;
-                    twin2BiasedData[idx + 3] = 255;
+                    twin2StrictData[i] = (strict === 0 || strict === 2) ? 0 : 255;
+                    twin2BiasedData[i] = (twin2Val === 0 || twin2Val === 2) ? 0 : 255;
                 }
             }
 
