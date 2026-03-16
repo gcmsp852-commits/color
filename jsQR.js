@@ -352,86 +352,99 @@ function buildBitMatrixFromBinary(data, width, height, returnInverted) {
     }
     return { binarized: binarized, inverted: inverted };
 }
+function buildScanResult(location_1, extracted, decoded, matrix, options) {
+    var res;
+    if (options && options.extractRawOnly) {
+        res = __assign({}, decoded, { location: {
+                topRightCorner: extracted.mappingFunction(location_1.dimension, 0),
+                topLeftCorner: extracted.mappingFunction(0, 0),
+                bottomRightCorner: extracted.mappingFunction(location_1.dimension, location_1.dimension),
+                bottomLeftCorner: extracted.mappingFunction(0, location_1.dimension),
+                topRightFinderPattern: location_1.topRight,
+                topLeftFinderPattern: location_1.topLeft,
+                bottomLeftFinderPattern: location_1.bottomLeft,
+                bottomRightAlignmentPattern: location_1.alignmentPattern,
+            } });
+    }
+    else {
+        res = {
+            binaryData: decoded.bytes,
+            data: decoded.text,
+            chunks: decoded.chunks,
+            version: decoded.version,
+            managementCode: decoded.managementCode,
+            location: {
+                topRightCorner: extracted.mappingFunction(location_1.dimension, 0),
+                topLeftCorner: extracted.mappingFunction(0, 0),
+                bottomRightCorner: extracted.mappingFunction(location_1.dimension, location_1.dimension),
+                bottomLeftCorner: extracted.mappingFunction(0, location_1.dimension),
+                topRightFinderPattern: location_1.topRight,
+                topLeftFinderPattern: location_1.topLeft,
+                bottomLeftFinderPattern: location_1.bottomLeft,
+                bottomRightAlignmentPattern: location_1.alignmentPattern,
+            },
+            matrix: matrix,
+            isRaw: decoded.isRaw,
+            codewords: decoded.codewords,
+            formatInfo: decoded.formatInfo,
+            rawMatrixData: decoded.rawMatrixData
+        };
+    }
+    return res;
+}
+function decodeMatrixAtLocation(matrix, location_1, options) {
+    if (!matrix || !location_1) {
+        return null;
+    }
+    try {
+        var extracted = extractor_1.extract(matrix, location_1);
+        var decoded = decoder_1.decode(extracted.matrix, options);
+        if (!decoded) {
+            return null;
+        }
+        return buildScanResult(location_1, extracted, decoded, matrix, options);
+    }
+    catch (e) {
+        return null;
+    }
+}
 function scan(matrix, options) {
     var locations = locator_1.locate(matrix, options);
-    // ★ singleLocate では候補を絞る（ただし精度確保のため2つまで許可）
     if (locations && options && options.singleLocate && !options.multi && locations.length > 2) {
         locations = locations.slice(0, 2);
     }
     if (!locations)
         return null;
-    var results = []; // ★ 追加：結果を格納する配列
+    var results = [];
     for (var _i = 0, locations_1 = locations; _i < locations_1.length; _i++) {
         var location_1 = locations_1[_i];
-        var extracted = extractor_1.extract(matrix, location_1);
-        var decoded = decoder_1.decode(extracted.matrix, options);
-        if (decoded) {
-            var res = void 0;
-            if (options && options.extractRawOnly) {
-                res = __assign({}, decoded, { location: {
-                        topRightCorner: extracted.mappingFunction(location_1.dimension, 0),
-                        topLeftCorner: extracted.mappingFunction(0, 0),
-                        bottomRightCorner: extracted.mappingFunction(location_1.dimension, location_1.dimension),
-                        bottomLeftCorner: extracted.mappingFunction(0, location_1.dimension),
-                        topRightFinderPattern: location_1.topRight,
-                        topLeftFinderPattern: location_1.topLeft,
-                        bottomLeftFinderPattern: location_1.bottomLeft,
-                        bottomRightAlignmentPattern: location_1.alignmentPattern,
-                    } });
-            }
-            else {
-                res = {
-                    binaryData: decoded.bytes,
-                    data: decoded.text,
-                    chunks: decoded.chunks,
-                    version: decoded.version,
-                    managementCode: decoded.managementCode,
-                    location: {
-                        topRightCorner: extracted.mappingFunction(location_1.dimension, 0),
-                        topLeftCorner: extracted.mappingFunction(0, 0),
-                        bottomRightCorner: extracted.mappingFunction(location_1.dimension, location_1.dimension),
-                        bottomLeftCorner: extracted.mappingFunction(0, location_1.dimension),
-                        topRightFinderPattern: location_1.topRight,
-                        topLeftFinderPattern: location_1.topLeft,
-                        bottomLeftFinderPattern: location_1.bottomLeft,
-                        bottomRightAlignmentPattern: location_1.alignmentPattern,
-                    },
-                    matrix: matrix,
-                    isRaw: decoded.isRaw,
-                    codewords: decoded.codewords,
-                    formatInfo: decoded.formatInfo,
-                    rawMatrixData: decoded.rawMatrixData
-                };
-            }
+        var res = decodeMatrixAtLocation(matrix, location_1, options);
+        if (res) {
             if (options && options.multi) {
-                results.push(res); // ★ multiモードなら配列に追加して続行
+                results.push(res);
             }
             else {
-                // multi: false だが、抽出したデータがRAW(復号失敗)だった場合、
-                // 他にもっと良い候補（正常に読める第1QR）があるかもしれないため、リターンせずに後回しにする
                 if (res.isRaw) {
                     results.push(res);
                 } else {
-                    return res; // 正常に読めたQRがあれば即座に返す
+                    return res;
                 }
             }
         }
     }
-    
-    // 正常に読めたものがなく、RAW（失敗）だけが残った場合、あるいはmultiモードの場合
     if (results.length > 0) {
         if (options && options.multi) {
             return results;
         } else {
-            return results[0]; // multi:falseなら最初のRAWを返す（復号失敗時の生データ取得用）
+            return results[0];
         }
     }
     return null;
 }
 var defaultOptions = { inversionAttempts: "attemptBoth" };
-function jsQR(data, width, height, providedOptions) {
+function buildJsQROptions(providedOptions) {
     if (providedOptions === void 0) { providedOptions = {}; }
-    var options = {
+    return {
         inversionAttempts: providedOptions.inversionAttempts || defaultOptions.inversionAttempts,
         appEncMask: providedOptions.appEncMask,
         extractRawOnly: providedOptions.extractRawOnly,
@@ -441,11 +454,17 @@ function jsQR(data, width, height, providedOptions) {
         preBinarized: providedOptions.preBinarized,
         singleLocate: providedOptions.singleLocate
     };
+}
+function buildScanMatrices(data, width, height, options) {
     var shouldInvert = options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst";
     var tryInvertedFirst = options.inversionAttempts === "onlyInvert" || options.inversionAttempts === "invertFirst";
     var _a = options.preBinarized ? buildBitMatrixFromBinary(data, width, height, shouldInvert) : binarizer_1.binarize(data, width, height, shouldInvert), binarized = _a.binarized, inverted = _a.inverted;
+    return { shouldInvert: shouldInvert, tryInvertedFirst: tryInvertedFirst, binarized: binarized, inverted: inverted };
+}
+function jsQR(data, width, height, providedOptions) {
+    var options = buildJsQROptions(providedOptions);
+    var _a = buildScanMatrices(data, width, height, options), tryInvertedFirst = _a.tryInvertedFirst, binarized = _a.binarized, inverted = _a.inverted;
     var result = scan(tryInvertedFirst ? inverted : binarized, options);
-    // ★ multiモード時の両面スキャン統合ロジック
     if (options.multi) {
         var allResults = result ? result : [];
         if (options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst") {
@@ -462,6 +481,17 @@ function jsQR(data, width, height, providedOptions) {
     return result;
 }
 jsQR.default = jsQR;
+jsQR.decodeAtLocation = function (data, width, height, location, providedOptions) {
+    var options = buildJsQROptions(providedOptions);
+    var _a = buildScanMatrices(data, width, height, options), tryInvertedFirst = _a.tryInvertedFirst, binarized = _a.binarized, inverted = _a.inverted;
+    var firstMatrix = tryInvertedFirst ? inverted : binarized;
+    var secondMatrix = tryInvertedFirst ? binarized : inverted;
+    var result = decodeMatrixAtLocation(firstMatrix, location, options);
+    if (!result && (options.inversionAttempts === "attemptBoth" || options.inversionAttempts === "invertFirst")) {
+        result = decodeMatrixAtLocation(secondMatrix, location, options);
+    }
+    return result;
+};
 jsQR.resumeDecode = function (rawData, appMask) {
     if (!rawData)
         return null;

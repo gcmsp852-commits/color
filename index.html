@@ -1308,6 +1308,40 @@
             return avg > 0 ? (avg / modules) : null;
         }
 
+        function shiftQrPoint(point, offsetX, offsetY) {
+            return point ? { x: point.x + offsetX, y: point.y + offsetY } : null;
+        }
+
+        function buildGuidedQrLocation(seed, offsetX, offsetY) {
+            if (!seed || typeof seed.version !== 'number' || !seed.location) return null;
+            const loc = seed.location;
+            const topLeft = loc.topLeftFinderPattern || loc.topLeftCorner;
+            const topRight = loc.topRightFinderPattern || loc.topRightCorner;
+            const bottomLeft = loc.bottomLeftFinderPattern || loc.bottomLeftCorner;
+            const alignmentPattern = loc.bottomRightAlignmentPattern || loc.bottomRightCorner;
+            if (!topLeft || !topRight || !bottomLeft || !alignmentPattern) return null;
+            return {
+                dimension: 17 + 4 * seed.version,
+                topLeft: shiftQrPoint(topLeft, offsetX, offsetY),
+                topRight: shiftQrPoint(topRight, offsetX, offsetY),
+                bottomLeft: shiftQrPoint(bottomLeft, offsetX, offsetY),
+                alignmentPattern: shiftQrPoint(alignmentPattern, offsetX, offsetY)
+            };
+        }
+
+        function decodeGuidedColorQr(scanPass, width, height, seed, offsetX, offsetY, acceptQr = null) {
+            if (!scanPass || !scanPass.data || !seed || !jsQR.decodeAtLocation) return null;
+            const guidedLocation = buildGuidedQrLocation(seed, offsetX, offsetY);
+            if (!guidedLocation) return null;
+            const res = jsQR.decodeAtLocation(scanPass.data, width, height, guidedLocation, {
+                inversionAttempts: scanPass.inversionAttempts || 'dontInvert',
+                preBinarized: !!scanPass.preBinarized
+            });
+            if (!res || !res.data) return null;
+            if (acceptQr && !acceptQr(res)) return null;
+            return res;
+        }
+
         function decodeSingleColorQr(scanPass, width, height, acceptQr = null) {
             if (!scanPass || !scanPass.data) return null;
             const opts = {
@@ -1398,19 +1432,49 @@
                 return { results: Array.from(found.values()), bbox: detectedBBox };
             }
 
-            // ★ Phase 2: クロップ方式で未発見のQRを探索
             const moduleSize = estimateModuleSizeFromQr(seed);
             if (!moduleSize) {
                 return { results: Array.from(found.values()), bbox: detectedBBox };
             }
 
-            // ★ 複数のシフト値で試行（moduleSize推定誤差を吸収）
             const shiftMultipliers = [8.5, 8.0, 9.0];
             for (const mult of shiftMultipliers) {
                 if (!stillNeedZero && !stillNeedOne) break;
 
                 const shiftPx = Math.max(1, Math.round(moduleSize * mult));
                 if (shiftPx >= width || shiftPx >= height) continue;
+
+                if (seedTopBit === 1 && stillNeedZero) {
+                    for (const scanPass of scanPasses) {
+                        const guided = decodeGuidedColorQr(scanPass, width, height, seed, -shiftPx, -shiftPx, (item) => getColorPairTopBit(item) !== 1);
+                        if (guided) {
+                            const key = getColorResultKey(guided);
+                            if (!found.has(key)) {
+                                found.set(key, guided);
+                                detectedBBox = mergeLocationBBox(detectedBBox, guided);
+                            }
+                            stillNeedZero = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (seedTopBit === 0 && stillNeedOne) {
+                    for (const scanPass of scanPasses) {
+                        const guided = decodeGuidedColorQr(scanPass, width, height, seed, shiftPx, shiftPx, (item) => getColorPairTopBit(item) !== 0);
+                        if (guided) {
+                            const key = getColorResultKey(guided);
+                            if (!found.has(key)) {
+                                found.set(key, guided);
+                                detectedBBox = mergeLocationBBox(detectedBBox, guided);
+                            }
+                            stillNeedOne = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (!stillNeedZero && !stillNeedOne) break;
 
                 const cropWidth = width - shiftPx;
                 const cropHeight = height - shiftPx;
