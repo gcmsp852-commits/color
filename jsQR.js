@@ -338,15 +338,17 @@ var decoder_1 = __webpack_require__(5);
 var extractor_1 = __webpack_require__(11);
 var locator_1 = __webpack_require__(12);
 function buildBitMatrixFromBinary(data, width, height, returnInverted) {
+    var totalPixels = width * height;
     var binarized = BitMatrix_1.BitMatrix.createEmpty(width, height);
+    var binData = binarized.data;
     var inverted = returnInverted ? BitMatrix_1.BitMatrix.createEmpty(width, height) : null;
-    var isSingleChannel = data.length === width * height;
-    for (var i = 0, offset = 0; i < width * height; i++, offset += isSingleChannel ? 1 : 4) {
-        var bit = data[offset] < 128;
-        binarized.data[i] = bit ? 1 : 0;
-        if (returnInverted) {
-            inverted.data[i] = bit ? 0 : 1;
-        }
+    var invData = inverted ? inverted.data : null;
+    var isSingleChannel = data.length === totalPixels;
+    var step = isSingleChannel ? 1 : 4;
+    for (var i = 0, offset = 0; i < totalPixels; i++, offset += step) {
+        var bit = data[offset] < 128 ? 1 : 0;
+        binData[i] = bit;
+        if (invData) invData[i] = 1 - bit;
     }
     return { binarized: binarized, inverted: inverted };
 }
@@ -495,85 +497,88 @@ var Matrix = /** @class */ (function () {
     return Matrix;
 }());
 function binarize(data, width, height, returnInverted) {
-    if (data.length !== width * height * 4) {
+    var dataLen = width * height * 4;
+    if (data.length !== dataLen) {
         throw new Error("Malformed data passed to binarizer.");
     }
-    // Convert image to greyscale
-    var greyscalePixels = new Matrix(width, height);
-    for (var x = 0; x < width; x++) {
-        for (var y = 0; y < height; y++) {
-            var r = data[((y * width + x) * 4) + 0];
-            var g = data[((y * width + x) * 4) + 1];
-            var b = data[((y * width + x) * 4) + 2];
-            greyscalePixels.set(x, y, 0.2126 * r + 0.7152 * g + 0.0722 * b);
-        }
+    // Convert image to greyscale - single linear pass (cache-friendly)
+    var totalPixels = width * height;
+    var greyscaleData = new Uint8ClampedArray(totalPixels);
+    for (var i = 0, di = 0; i < totalPixels; i++, di += 4) {
+        greyscaleData[i] = (data[di] * 54 + data[di + 1] * 183 + data[di + 2] * 19) >> 8;
     }
     var horizontalRegionCount = Math.ceil(width / REGION_SIZE);
     var verticalRegionCount = Math.ceil(height / REGION_SIZE);
-    var blackPoints = new Matrix(horizontalRegionCount, verticalRegionCount);
+    var bpData = new Uint8ClampedArray(horizontalRegionCount * verticalRegionCount);
     for (var verticalRegion = 0; verticalRegion < verticalRegionCount; verticalRegion++) {
+        var baseY = verticalRegion * REGION_SIZE;
         for (var hortizontalRegion = 0; hortizontalRegion < horizontalRegionCount; hortizontalRegion++) {
+            var baseX = hortizontalRegion * REGION_SIZE;
             var sum = 0;
-            var min = Infinity;
+            var min = 255;
             var max = 0;
-            for (var y = 0; y < REGION_SIZE; y++) {
-                for (var x = 0; x < REGION_SIZE; x++) {
-                    var pixelLumosity = greyscalePixels.get(hortizontalRegion * REGION_SIZE + x, verticalRegion * REGION_SIZE + y);
+            var endY = baseY + REGION_SIZE;
+            var endX = baseX + REGION_SIZE;
+            if (endY > height) endY = height;
+            if (endX > width) endX = width;
+            for (var y = baseY; y < endY; y++) {
+                var rowOffset = y * width;
+                for (var x = baseX; x < endX; x++) {
+                    var pixelLumosity = greyscaleData[rowOffset + x];
                     sum += pixelLumosity;
-                    min = Math.min(min, pixelLumosity);
-                    max = Math.max(max, pixelLumosity);
+                    if (pixelLumosity < min) min = pixelLumosity;
+                    if (pixelLumosity > max) max = pixelLumosity;
                 }
             }
-            var average = sum / (Math.pow(REGION_SIZE, 2));
+            var regionPixels = (endY - baseY) * (endX - baseX);
+            var average = sum / regionPixels;
             if (max - min <= MIN_DYNAMIC_RANGE) {
-                // If variation within the block is low, assume this is a block with only light or only
-                // dark pixels. In that case we do not want to use the average, as it would divide this
-                // low contrast area into black and white pixels, essentially creating data out of noise.
-                //
-                // Default the blackpoint for these blocks to be half the min - effectively white them out
                 average = min / 2;
                 if (verticalRegion > 0 && hortizontalRegion > 0) {
-                    // Correct the "white background" assumption for blocks that have neighbors by comparing
-                    // the pixels in this block to the previously calculated black points. This is based on
-                    // the fact that dark barcode symbology is always surrounded by some amount of light
-                    // background for which reasonable black point estimates were made. The bp estimated at
-                    // the boundaries is used for the interior.
-                    // The (min < bp) is arbitrary but works better than other heuristics that were tried.
-                    var averageNeighborBlackPoint = (blackPoints.get(hortizontalRegion, verticalRegion - 1) +
-                        (2 * blackPoints.get(hortizontalRegion - 1, verticalRegion)) +
-                        blackPoints.get(hortizontalRegion - 1, verticalRegion - 1)) / 4;
+                    var bpIdx = verticalRegion * horizontalRegionCount + hortizontalRegion;
+                    var averageNeighborBlackPoint = (bpData[bpIdx - horizontalRegionCount] +
+                        (2 * bpData[bpIdx - 1]) +
+                        bpData[bpIdx - horizontalRegionCount - 1]) / 4;
                     if (min < averageNeighborBlackPoint) {
                         average = averageNeighborBlackPoint;
                     }
                 }
             }
-            blackPoints.set(hortizontalRegion, verticalRegion, average);
+            bpData[verticalRegion * horizontalRegionCount + hortizontalRegion] = average;
         }
     }
     var binarized = BitMatrix_1.BitMatrix.createEmpty(width, height);
+    var binData = binarized.data;
     var inverted = null;
+    var invData = null;
     if (returnInverted) {
         inverted = BitMatrix_1.BitMatrix.createEmpty(width, height);
+        invData = inverted.data;
     }
     for (var verticalRegion = 0; verticalRegion < verticalRegionCount; verticalRegion++) {
+        var baseY = verticalRegion * REGION_SIZE;
         for (var hortizontalRegion = 0; hortizontalRegion < horizontalRegionCount; hortizontalRegion++) {
+            var baseX = hortizontalRegion * REGION_SIZE;
             var left = numBetween(hortizontalRegion, 2, horizontalRegionCount - 3);
             var top_1 = numBetween(verticalRegion, 2, verticalRegionCount - 3);
             var sum = 0;
-            for (var xRegion = -2; xRegion <= 2; xRegion++) {
-                for (var yRegion = -2; yRegion <= 2; yRegion++) {
-                    sum += blackPoints.get(left + xRegion, top_1 + yRegion);
-                }
+            for (var yRegion = -2; yRegion <= 2; yRegion++) {
+                var rowIdx = (top_1 + yRegion) * horizontalRegionCount + left;
+                sum += bpData[rowIdx - 2] + bpData[rowIdx - 1] + bpData[rowIdx] + bpData[rowIdx + 1] + bpData[rowIdx + 2];
             }
             var threshold = sum / 25;
-            for (var xRegion = 0; xRegion < REGION_SIZE; xRegion++) {
-                for (var yRegion = 0; yRegion < REGION_SIZE; yRegion++) {
-                    var x = hortizontalRegion * REGION_SIZE + xRegion;
-                    var y = verticalRegion * REGION_SIZE + yRegion;
-                    var lum = greyscalePixels.get(x, y);
-                    binarized.set(x, y, lum <= threshold);
-                    if (returnInverted) {
-                        inverted.set(x, y, !(lum <= threshold));
+            var endY = baseY + REGION_SIZE;
+            var endX = baseX + REGION_SIZE;
+            if (endY > height) endY = height;
+            if (endX > width) endX = width;
+            for (var y = baseY; y < endY; y++) {
+                var rowOffset = y * width;
+                for (var x = baseX; x < endX; x++) {
+                    var idx = rowOffset + x;
+                    var bit = greyscaleData[idx] <= threshold ? 1 : 0;
+                    binData[idx] = bit;
+                    if (invData) {
+                        invData[idx] = 1 - bit;
                     }
                 }
             }
@@ -10037,58 +10042,86 @@ function locate(matrix, options) {
     var activeFinderPatternQuads = [];
     var alignmentPatternQuads = [];
     var activeAlignmentPatternQuads = [];
+    // ★ 高速化: 大きな画像では行をスキップ（ファインダーパターンは十分大きいため検出漏れなし）
+    var yStep = (matrix.height > 300 && options && options.singleLocate) ? 2 : 1;
+    var matrixData = matrix.data;
+    var matrixWidth = matrix.width;
     var _loop_1 = function (y) {
         var length_1 = 0;
         var lastBit = false;
-        var scans = [0, 0, 0, 0, 0];
-        var _loop_2 = function (x) {
-            var v = matrix.get(x, y);
+        var s0 = 0, s1 = 0, s2 = 0, s3 = 0, s4 = 0;
+        var rowOffset = y * matrixWidth;
+        for (var x = -1; x <= matrixWidth; x++) {
+            var v = x >= 0 && x < matrixWidth ? (matrixData[rowOffset + x] === 1) : false;
             if (v === lastBit) {
                 length_1++;
             }
             else {
-                scans = [scans[1], scans[2], scans[3], scans[4], length_1];
+                s0 = s1; s1 = s2; s2 = s3; s3 = s4; s4 = length_1;
                 length_1 = 1;
                 lastBit = v;
-                var averageFinderPatternBlocksize = sum(scans) / 7;
-                var validFinderPattern = Math.abs(scans[0] - averageFinderPatternBlocksize) < averageFinderPatternBlocksize && Math.abs(scans[1] - averageFinderPatternBlocksize) < averageFinderPatternBlocksize && Math.abs(scans[2] - 3 * averageFinderPatternBlocksize) < 3 * averageFinderPatternBlocksize && Math.abs(scans[3] - averageFinderPatternBlocksize) < averageFinderPatternBlocksize && Math.abs(scans[4] - averageFinderPatternBlocksize) < averageFinderPatternBlocksize && !v;
-                var averageAlignmentPatternBlocksize = sum(scans.slice(-3)) / 3;
-                var validAlignmentPattern = Math.abs(scans[2] - averageAlignmentPatternBlocksize) < averageAlignmentPatternBlocksize && Math.abs(scans[3] - averageAlignmentPatternBlocksize) < averageAlignmentPatternBlocksize && Math.abs(scans[4] - averageAlignmentPatternBlocksize) < averageAlignmentPatternBlocksize && v;
-                if (validFinderPattern) {
-                    var endX_1 = x - scans[3] - scans[4];
-                    var startX_1 = endX_1 - scans[2];
+                var scanSum = s0 + s1 + s2 + s3 + s4;
+                var averageFinderPatternBlocksize = scanSum / 7;
+                if (averageFinderPatternBlocksize >= 1 &&
+                    Math.abs(s0 - averageFinderPatternBlocksize) < averageFinderPatternBlocksize &&
+                    Math.abs(s1 - averageFinderPatternBlocksize) < averageFinderPatternBlocksize &&
+                    Math.abs(s2 - 3 * averageFinderPatternBlocksize) < 3 * averageFinderPatternBlocksize &&
+                    Math.abs(s3 - averageFinderPatternBlocksize) < averageFinderPatternBlocksize &&
+                    Math.abs(s4 - averageFinderPatternBlocksize) < averageFinderPatternBlocksize && !v) {
+                    var endX_1 = x - s3 - s4;
+                    var startX_1 = endX_1 - s2;
                     var line = { startX: startX_1, endX: endX_1, y: y };
-                    var matchingQuads = activeFinderPatternQuads.filter(function (q) { return (startX_1 >= q.bottom.startX && startX_1 <= q.bottom.endX) || (endX_1 >= q.bottom.startX && startX_1 <= q.bottom.endX) || (startX_1 <= q.bottom.startX && endX_1 >= q.bottom.endX && ((scans[2] / (q.bottom.endX - q.bottom.startX)) < MAX_QUAD_RATIO && (scans[2] / (q.bottom.endX - q.bottom.startX)) > MIN_QUAD_RATIO)); });
-                    if (matchingQuads.length > 0) {
-                        matchingQuads[0].bottom = line;
+                    var matched = false;
+                    for (var qi = activeFinderPatternQuads.length - 1; qi >= 0; qi--) {
+                        var q = activeFinderPatternQuads[qi];
+                        if ((startX_1 >= q.bottom.startX && startX_1 <= q.bottom.endX) ||
+                            (endX_1 >= q.bottom.startX && startX_1 <= q.bottom.endX) ||
+                            (startX_1 <= q.bottom.startX && endX_1 >= q.bottom.endX &&
+                             (s2 / (q.bottom.endX - q.bottom.startX)) < MAX_QUAD_RATIO &&
+                             (s2 / (q.bottom.endX - q.bottom.startX)) > MIN_QUAD_RATIO)) {
+                            q.bottom = line;
+                            matched = true;
+                            break;
+                        }
                     }
-                    else {
+                    if (!matched) {
                         activeFinderPatternQuads.push({ top: line, bottom: line });
                     }
                 }
-                if (validAlignmentPattern) {
-                    var endX_2 = x - scans[4];
-                    var startX_2 = endX_2 - scans[3];
+                var aSum = s2 + s3 + s4;
+                var averageAlignmentPatternBlocksize = aSum / 3;
+                if (averageAlignmentPatternBlocksize >= 1 &&
+                    Math.abs(s2 - averageAlignmentPatternBlocksize) < averageAlignmentPatternBlocksize &&
+                    Math.abs(s3 - averageAlignmentPatternBlocksize) < averageAlignmentPatternBlocksize &&
+                    Math.abs(s4 - averageAlignmentPatternBlocksize) < averageAlignmentPatternBlocksize && v) {
+                    var endX_2 = x - s4;
+                    var startX_2 = endX_2 - s3;
                     var line = { startX: startX_2, y: y, endX: endX_2 };
-                    var matchingQuads = activeAlignmentPatternQuads.filter(function (q) { return (startX_2 >= q.bottom.startX && startX_2 <= q.bottom.endX) || (endX_2 >= q.bottom.startX && startX_2 <= q.bottom.endX) || (startX_2 <= q.bottom.startX && endX_2 >= q.bottom.endX && ((scans[2] / (q.bottom.endX - q.bottom.startX)) < MAX_QUAD_RATIO && (scans[2] / (q.bottom.endX - q.bottom.startX)) > MIN_QUAD_RATIO)); });
-                    if (matchingQuads.length > 0) {
-                        matchingQuads[0].bottom = line;
+                    var matched = false;
+                    for (var qi = activeAlignmentPatternQuads.length - 1; qi >= 0; qi--) {
+                        var q = activeAlignmentPatternQuads[qi];
+                        if ((startX_2 >= q.bottom.startX && startX_2 <= q.bottom.endX) ||
+                            (endX_2 >= q.bottom.startX && startX_2 <= q.bottom.endX) ||
+                            (startX_2 <= q.bottom.startX && endX_2 >= q.bottom.endX &&
+                             (s2 / (q.bottom.endX - q.bottom.startX)) < MAX_QUAD_RATIO &&
+                             (s2 / (q.bottom.endX - q.bottom.startX)) > MIN_QUAD_RATIO)) {
+                            q.bottom = line;
+                            matched = true;
+                            break;
+                        }
                     }
-                    else {
+                    if (!matched) {
                         activeAlignmentPatternQuads.push({ top: line, bottom: line });
                     }
                 }
             }
-        };
-        for (var x = -1; x <= matrix.width; x++) {
-            _loop_2(x);
         }
         finderPatternQuads.push.apply(finderPatternQuads, activeFinderPatternQuads.filter(function (q) { return q.bottom.y !== y && q.bottom.y - q.top.y >= 2; }));
         activeFinderPatternQuads = activeFinderPatternQuads.filter(function (q) { return q.bottom.y === y; });
         alignmentPatternQuads.push.apply(alignmentPatternQuads, activeAlignmentPatternQuads.filter(function (q) { return q.bottom.y !== y; }));
         activeAlignmentPatternQuads = activeAlignmentPatternQuads.filter(function (q) { return q.bottom.y === y; });
     };
-    for (var y = 0; y <= matrix.height; y++) {
+    for (var y = 0; y <= matrix.height; y += yStep) {
         _loop_1(y);
     }
     finderPatternQuads.push.apply(finderPatternQuads, activeFinderPatternQuads.filter(function (q) { return q.bottom.y - q.top.y >= 2; }));

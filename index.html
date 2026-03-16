@@ -243,15 +243,15 @@
         let digitalSignStage3 = false; // 電子署名モードの第2QR（もしくはペア）探索中フラグ
         let lastTwinBBox = null; // ★ Stage 1で検出したツインQRの領域を保存
 
-        const SCAN_INTERVAL_MS = 50;
-        const COLOR_FAST_MAX_DIM = 320;
-        const COLOR_FULL_MAX_DIM = 480;
-        const COLOR_FOCUS_MAX_DIM = 640;
+        const SCAN_INTERVAL_MS = 40;
+        const COLOR_FAST_MAX_DIM = 400;
+        const COLOR_FULL_MAX_DIM = 560;
+        const COLOR_FOCUS_MAX_DIM = 720;
         const COLOR_REFINE_MAX_DIM = 960;
-        const COLOR_FULL_SCAN_EVERY = 10;
-        const COLOR_FOCUS_REFRESH_EVERY = 20;
-        const COLOR_DETECT_REFRESH_EVERY = 3;
-        const COLOR_BBOX_PADDING = 56;
+        const COLOR_FULL_SCAN_EVERY = 8;
+        const COLOR_FOCUS_REFRESH_EVERY = 15;
+        const COLOR_DETECT_REFRESH_EVERY = 2;
+        const COLOR_BBOX_PADDING = 64;
 
         // モード: 'normal' or 'double'
         let scanMode = 'normal';
@@ -919,11 +919,16 @@
                 }
             }
 
-            const colorDecoded = processColorQRTwin(frameData, plan.targetWidth, plan.targetHeight, colorScanResult);
-            if (colorDecoded) {
-                mergeColorScanResult(colorDecoded);
-                if (colorDecoded.bbox) {
-                    localBBox = mergeBBox(localBBox, colorDecoded.bbox);
+            // ★ 高速化: Twin1が両方見つかっていてTwin2も不要なら processColorQRTwin をスキップ
+            const stillNeedTwin1 = !(colorScanResult.qr1 && colorScanResult.qr2);
+            const stillNeedTwin2 = !(colorScanResult.qr3 && colorScanResult.qr4);
+            if (stillNeedTwin1 || stillNeedTwin2) {
+                const colorDecoded = processColorQRTwin(frameData, plan.targetWidth, plan.targetHeight, colorScanResult);
+                if (colorDecoded) {
+                    mergeColorScanResult(colorDecoded);
+                    if (colorDecoded.bbox) {
+                        localBBox = mergeBBox(localBBox, colorDecoded.bbox);
+                    }
                 }
             }
 
@@ -1180,8 +1185,8 @@
 
         function buildChannelMonochromeRgba(src, pixelCount, channelIndex) {
             const out = new Uint8ClampedArray(pixelCount * 4);
-            for (let i = 0; i < pixelCount; i++) {
-                const idx = i * 4;
+            const len4 = pixelCount * 4;
+            for (let idx = 0; idx < len4; idx += 4) {
                 const value = src[idx + channelIndex];
                 out[idx] = value;
                 out[idx + 1] = value;
@@ -1229,19 +1234,15 @@
             const startY = Math.max(0, Math.min(height - 1, Math.round(sy)));
             const outWidth = Math.max(1, Math.min(width - startX, Math.round(cropWidth)));
             const outHeight = Math.max(1, Math.min(height - startY, Math.round(cropHeight)));
-            const out = new Uint8ClampedArray(outWidth * outHeight * 4);
+            const outLen = outWidth * outHeight * 4;
+            const out = new Uint8ClampedArray(outLen);
+            // ★ 高速化: fill(255)で一括初期化 → subarray copyで上書き
+            out.fill(255);
 
-            for (let i = 0; i < out.length; i += 4) {
-                out[i] = 255;
-                out[i + 1] = 255;
-                out[i + 2] = 255;
-                out[i + 3] = 255;
-            }
-
+            const rowBytes = outWidth * 4;
             for (let y = 0; y < outHeight; y++) {
                 const srcStart = ((startY + y) * width + startX) * 4;
-                const srcEnd = srcStart + outWidth * 4;
-                out.set(src.subarray(srcStart, srcEnd), y * outWidth * 4);
+                out.set(src.subarray(srcStart, srcStart + rowBytes), y * rowBytes);
             }
 
             return { data: out, width: outWidth, height: outHeight, offsetX: startX, offsetY: startY };
@@ -1314,6 +1315,15 @@
                 return { results: Array.from(found.values()), bbox: detectedBBox };
             }
 
+            // ★ 高速化: seedがすでにneedZero/needOneの一方を満たしているか判定
+            const seedTopBit = getColorPairTopBit(seed);
+            const stillNeedZero = needZero && seedTopBit !== 0;
+            const stillNeedOne = needOne && seedTopBit !== 1;
+
+            if (!stillNeedZero && !stillNeedOne) {
+                return { results: Array.from(found.values()), bbox: detectedBBox };
+            }
+
             const moduleSize = estimateModuleSizeFromQr(seed);
             const shiftPx = moduleSize ? Math.max(1, Math.round(moduleSize * 8.5)) : null;
             if (!shiftPx || shiftPx >= width || shiftPx >= height) {
@@ -1323,7 +1333,7 @@
             const cropWidth = width - shiftPx;
             const cropHeight = height - shiftPx;
 
-            if (needZero) {
+            if (stillNeedZero) {
                 const scanPass = scanPasses[0];
                 const crop = cropMonochromeRgbaImage(scanPass.data, width, height, 0, 0, cropWidth, cropHeight);
                 const qr = decodeSingleColorQr({
@@ -1342,7 +1352,7 @@
                 }
             }
 
-            if (needOne) {
+            if (stillNeedOne) {
                 const scanPass = scanPasses[0];
                 const crop = cropMonochromeRgbaImage(scanPass.data, width, height, shiftPx, shiftPx, cropWidth, cropHeight);
                 const qr = decodeSingleColorQr({
@@ -1407,6 +1417,18 @@
             const pixelCount = width * height;
             const profiles = getSelectedColorProfiles(colorEncDarkName, colorEncLightName);
 
+            // ★ 高速化: プロファイル値をローカル変数にキャッシュ
+            const pBlackR = profiles.black.r, pBlackG = profiles.black.g, pBlackB = profiles.black.b;
+            const pDarkR = profiles.dark.r, pDarkG = profiles.dark.g, pDarkB = profiles.dark.b;
+            const pLightR = profiles.light.r, pLightG = profiles.light.g, pLightB = profiles.light.b;
+            const pWhiteR = profiles.white.r, pWhiteG = profiles.white.g, pWhiteB = profiles.white.b;
+            const isDarkBlack = colorEncDarkName === 'black';
+            const isLightWhite = colorEncLightName === 'white';
+            const isDarkRed = colorEncDarkName === 'red';
+            const isDarkBlue = colorEncDarkName === 'blue';
+            const isLightGreen = colorEncLightName === 'green';
+            const isLightYellow = colorEncLightName === 'yellow';
+
             const twin1StrictData = needTwin1 ? new Uint8ClampedArray(pixelCount * 4) : null;
             const twin2StrictData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
             const twin2BiasedData = needTwin2 ? new Uint8ClampedArray(pixelCount * 4) : null;
@@ -1416,17 +1438,85 @@
                 const r = src[idx];
                 const g = src[idx + 1];
                 const b = src[idx + 2];
-                const colorCls = classifyColorFast(r, g, b, profiles, colorEncDarkName, colorEncLightName);
-                const strictCls = colorCls.strict;
+
+                // ★ インライン化した classifyColorFast (関数呼び出しオーバーヘッド削減)
+                const maxRgb = r > g ? (r > b ? r : b) : (g > b ? g : b);
+                const minRgb = r < g ? (r < b ? r : b) : (g < b ? g : b);
+                const chroma = maxRgb - minRgb;
+                const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+
+                let strict, twin2Val;
+
+                if (luma <= 26 && chroma <= 46) {
+                    strict = 0; // black
+                    twin2Val = 0;
+                } else if (luma >= 238 && chroma <= 38) {
+                    strict = 3; // white
+                    twin2Val = 3;
+                } else {
+                    // インライン distance3
+                    const blackScore = (r < pBlackR ? pBlackR - r : r - pBlackR) + (g < pBlackG ? pBlackG - g : g - pBlackG) + (b < pBlackB ? pBlackB - b : b - pBlackB) + luma + chroma * 0.18;
+                    let darkScore = (r < pDarkR ? pDarkR - r : r - pDarkR) + (g < pDarkG ? pDarkG - g : g - pDarkG) + (b < pDarkB ? pDarkB - b : b - pDarkB) + (40 - chroma > 0 ? (40 - chroma) * 1.25 : 0) + (luma - 225 > 0 ? (luma - 225) * 0.35 : 0);
+                    let lightScore = (r < pLightR ? pLightR - r : r - pLightR) + (g < pLightG ? pLightG - g : g - pLightG) + (b < pLightB ? pLightB - b : b - pLightB) + (34 - chroma > 0 ? (34 - chroma) * 1.05 : 0) + (92 - luma > 0 ? (92 - luma) * 0.45 : 0);
+                    const whiteScore = (r < pWhiteR ? pWhiteR - r : r - pWhiteR) + (g < pWhiteG ? pWhiteG - g : g - pWhiteG) + (b < pWhiteB ? pWhiteB - b : b - pWhiteB) + (255 - luma) + chroma * 0.12;
+
+                    if (chroma < 30) {
+                        darkScore += 28;
+                        lightScore += 18;
+                    }
+
+                    if (isDarkRed) {
+                        const dom = r - (g > b ? g : b);
+                        darkScore = dom > 0 ? darkScore - dom * 1.25 : darkScore + (-dom) * 0.12;
+                    } else if (isDarkBlue) {
+                        const dom = b - (r > g ? r : g);
+                        darkScore = dom > 0 ? darkScore - dom * 1.05 : darkScore + (-dom) * 0.12;
+                    }
+
+                    if (isLightGreen) {
+                        const dom = g - (r > b ? r : b);
+                        lightScore = dom > 0 ? lightScore - dom * 1.18 : lightScore + (-dom) * 0.12;
+                    } else if (isLightYellow) {
+                        const dom = (r < g ? r : g) - b;
+                        lightScore = dom > 0 ? lightScore - dom * 0.95 : lightScore + (-dom) * 0.12;
+                    }
+
+                    if (isDarkBlack) darkScore = blackScore + 2;
+                    if (isLightWhite) lightScore = whiteScore + 2;
+
+                    // 0=black, 1=dark, 2=light, 3=white
+                    strict = 0;
+                    let bestScore = blackScore;
+                    if (darkScore < bestScore) { bestScore = darkScore; strict = 1; }
+                    if (lightScore < bestScore) { bestScore = lightScore; strict = 2; }
+                    if (whiteScore < bestScore) { strict = 3; }
+
+                    twin2Val = strict;
+                    if (strict === 0 && darkScore + 16 < blackScore) twin2Val = 1;
+                    else if (strict === 3 && lightScore + 16 < whiteScore) twin2Val = 2;
+                }
 
                 if (needTwin1) {
-                    setGrayPixel(twin1StrictData, idx, (strictCls === 'black' || strictCls === 'dark') ? 0 : 255);
+                    // black(0) or dark(1) → 0 (black pixel), else 255
+                    const v = strict <= 1 ? 0 : 255;
+                    twin1StrictData[idx] = v;
+                    twin1StrictData[idx + 1] = v;
+                    twin1StrictData[idx + 2] = v;
+                    twin1StrictData[idx + 3] = 255;
                 }
 
                 if (needTwin2) {
-                    setGrayPixel(twin2StrictData, idx, (strictCls === 'black' || strictCls === 'light') ? 0 : 255);
-                    const twin2Cls = colorCls.twin2;
-                    setGrayPixel(twin2BiasedData, idx, (twin2Cls === 'black' || twin2Cls === 'light') ? 0 : 255);
+                    // black(0) or light(2) → 0 (black pixel), else 255
+                    const vs = (strict === 0 || strict === 2) ? 0 : 255;
+                    twin2StrictData[idx] = vs;
+                    twin2StrictData[idx + 1] = vs;
+                    twin2StrictData[idx + 2] = vs;
+                    twin2StrictData[idx + 3] = 255;
+                    const vb = (twin2Val === 0 || twin2Val === 2) ? 0 : 255;
+                    twin2BiasedData[idx] = vb;
+                    twin2BiasedData[idx + 1] = vb;
+                    twin2BiasedData[idx + 2] = vb;
+                    twin2BiasedData[idx + 3] = 255;
                 }
             }
 
@@ -1520,16 +1610,18 @@
                         updateColorScanFocus(primaryPass.localBBox, plan, vw, vh);
 
                         let colorCount = primaryPass.colorCount;
-                        const refinePlan = buildColorFocusedPlan(vw, vh, COLOR_REFINE_MAX_DIM);
-                        const shouldRefine = refinePlan
-                            && colorCount < 4
-                            && (refinePlan.targetWidth > plan.targetWidth || refinePlan.targetHeight > plan.targetHeight)
-                            && (colorCount > 0 || (colorScanAttemptCount % COLOR_DETECT_REFRESH_EVERY === 0));
+                        // ★ 高速化: 1つでも見つかったら即座にリファインへ（Ver4/5向け）
+                        if (colorCount < 4) {
+                            const refinePlan = buildColorFocusedPlan(vw, vh, COLOR_REFINE_MAX_DIM);
+                            const shouldRefine = refinePlan
+                                && (refinePlan.targetWidth > plan.targetWidth || refinePlan.targetHeight > plan.targetHeight)
+                                && (colorCount > 0 || (colorScanAttemptCount % COLOR_DETECT_REFRESH_EVERY === 0));
 
-                        if (shouldRefine) {
-                            const refinePass = runColorScanPlan(refinePlan);
-                            updateColorScanFocus(refinePass.localBBox, refinePlan, vw, vh);
-                            colorCount = refinePass.colorCount;
+                            if (shouldRefine) {
+                                const refinePass = runColorScanPlan(refinePlan);
+                                updateColorScanFocus(refinePass.localBBox, refinePlan, vw, vh);
+                                colorCount = refinePass.colorCount;
+                            }
                         }
 
                         if (colorCount > 0 && colorCount < 4) {
