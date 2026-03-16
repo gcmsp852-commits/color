@@ -354,8 +354,9 @@ function buildBitMatrixFromBinary(data, width, height, returnInverted) {
 }
 function scan(matrix, options) {
     var locations = locator_1.locate(matrix, options);
-    if (locations && options && options.singleLocate && !options.multi && locations.length > 3) {
-        locations = locations.slice(0, 3);
+    // ★ 高速化: singleLocate では候補を最小限に絞る
+    if (locations && options && options.singleLocate && !options.multi && locations.length > 1) {
+        locations = locations.slice(0, 1);
     }
     if (!locations)
         return null;
@@ -9998,13 +9999,16 @@ function scoreBlackWhiteRun(sequence, ratios) {
 function scorePattern(point, ratios, matrix) {
     try {
         var horizontalRun = countBlackWhiteRun(point, { x: -1, y: point.y }, matrix, ratios.length);
+        var horzError = scoreBlackWhiteRun(horizontalRun, ratios);
+        // ★ 高速化: 水平方向だけで明らかに悪い候補は早期棄却
+        if (horzError.error > 100) return Infinity;
         var verticalRun = countBlackWhiteRun(point, { x: point.x, y: -1 }, matrix, ratios.length);
+        var vertError = scoreBlackWhiteRun(verticalRun, ratios);
+        if (horzError.error + vertError.error > 200) return Infinity;
         var topLeftPoint = { x: Math.max(0, point.x - point.y) - 1, y: Math.max(0, point.y - point.x) - 1 };
         var topLeftBottomRightRun = countBlackWhiteRun(point, topLeftPoint, matrix, ratios.length);
         var bottomLeftPoint = { x: Math.min(matrix.width, point.x + point.y) + 1, y: Math.min(matrix.height, point.y + point.x) + 1 };
         var bottomLeftTopRightRun = countBlackWhiteRun(point, bottomLeftPoint, matrix, ratios.length);
-        var horzError = scoreBlackWhiteRun(horizontalRun, ratios);
-        var vertError = scoreBlackWhiteRun(verticalRun, ratios);
         var diagDownError = scoreBlackWhiteRun(topLeftBottomRightRun, ratios);
         var diagUpError = scoreBlackWhiteRun(bottomLeftTopRightRun, ratios);
         var ratioError = Math.sqrt(horzError.error * horzError.error + vertError.error * vertError.error + diagDownError.error * diagDownError.error + diagUpError.error * diagUpError.error);
@@ -10185,8 +10189,8 @@ function locate(matrix, options) {
         return null;
     }
     var result = [];
-    // ★ 歪んだQRも拾えるように、処理に回すグループ数を増やす（6 -> 10）
-    var maxGroups = options && options.singleLocate ? 3 : 10;
+    var isSingle = options && options.singleLocate;
+    var maxGroups = isSingle ? 3 : 10;
     var groupsToProcess = finderPatternGroups.slice(0, maxGroups);
     for (var _i = 0, groupsToProcess_1 = groupsToProcess; _i < groupsToProcess_1.length; _i++) {
         var group = groupsToProcess_1[_i];
@@ -10200,19 +10204,24 @@ function locate(matrix, options) {
                 topLeft: { x: topLeft.x, y: topLeft.y },
                 topRight: { x: topRight.x, y: topRight.y },
             });
+            // ★ 高速化: singleLocate では最初に見つかったら即終了
+            if (isSingle) break;
         }
-        var midTopRight = recenterLocation(matrix, topRight);
-        var midTopLeft = recenterLocation(matrix, topLeft);
-        var midBottomLeft = recenterLocation(matrix, bottomLeft);
-        var centeredAlignment = findAlignmentPattern(matrix, alignmentPatternQuads, midTopRight, midTopLeft, midBottomLeft);
-        if (centeredAlignment) {
-            result.push({
-                alignmentPattern: { x: centeredAlignment.alignmentPattern.x, y: centeredAlignment.alignmentPattern.y },
-                bottomLeft: { x: midBottomLeft.x, y: midBottomLeft.y },
-                dimension: centeredAlignment.dimension,
-                topLeft: { x: midTopLeft.x, y: midTopLeft.y },
-                topRight: { x: midTopRight.x, y: midTopRight.y },
-            });
+        // ★ 高速化: singleLocate ではrecenter+再検索をスキップ（処理コスト半減）
+        if (!isSingle) {
+            var midTopRight = recenterLocation(matrix, topRight);
+            var midTopLeft = recenterLocation(matrix, topLeft);
+            var midBottomLeft = recenterLocation(matrix, bottomLeft);
+            var centeredAlignment = findAlignmentPattern(matrix, alignmentPatternQuads, midTopRight, midTopLeft, midBottomLeft);
+            if (centeredAlignment) {
+                result.push({
+                    alignmentPattern: { x: centeredAlignment.alignmentPattern.x, y: centeredAlignment.alignmentPattern.y },
+                    bottomLeft: { x: midBottomLeft.x, y: midBottomLeft.y },
+                    dimension: centeredAlignment.dimension,
+                    topLeft: { x: midTopLeft.x, y: midTopLeft.y },
+                    topRight: { x: midTopRight.x, y: midTopRight.y },
+                });
+            }
         }
     }
     if (result.length === 0) {
