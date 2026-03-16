@@ -247,6 +247,7 @@
         const COLOR_FAST_MAX_DIM = 320;
         const COLOR_FULL_MAX_DIM = 480;
         const COLOR_FOCUS_MAX_DIM = 640;
+        const COLOR_REFINE_MAX_DIM = 960;
         const COLOR_FULL_SCAN_EVERY = 10;
         const COLOR_FOCUS_REFRESH_EVERY = 20;
         const COLOR_DETECT_REFRESH_EVERY = 3;
@@ -819,31 +820,46 @@
             }
         }
 
-        function buildColorScanPlan(videoWidth, videoHeight) {
-            const refreshFullFrame = colorScanAttemptCount > 0 && (colorScanAttemptCount % COLOR_FOCUS_REFRESH_EVERY === 0);
-            const focusPadding = colorScanBBox
-                ? Math.max(COLOR_BBOX_PADDING, Math.round(Math.max(colorScanBBox.width, colorScanBBox.height) * 0.45))
+        function getColorFocusPadding(bbox) {
+            return bbox
+                ? Math.max(COLOR_BBOX_PADDING, Math.round(Math.max(bbox.width, bbox.height) * 0.45))
                 : COLOR_BBOX_PADDING;
-            const focusedBBox = (!refreshFullFrame && colorScanBBox)
-                ? expandBBox(colorScanBBox, focusPadding, videoWidth, videoHeight)
-                : null;
-            const useFocusedPlan = !!focusedBBox;
-            const useFullFrameFallback = !useFocusedPlan && (colorScanAttemptCount % COLOR_FULL_SCAN_EVERY === 0);
+        }
 
-            const sx = useFocusedPlan ? Math.floor(focusedBBox.x) : 0;
-            const sy = useFocusedPlan ? Math.floor(focusedBBox.y) : 0;
-            const sw = useFocusedPlan ? Math.max(1, Math.ceil(focusedBBox.width)) : videoWidth;
-            const sh = useFocusedPlan ? Math.max(1, Math.ceil(focusedBBox.height)) : videoHeight;
-            const maxDim = useFocusedPlan ? COLOR_FOCUS_MAX_DIM : (useFullFrameFallback ? COLOR_FULL_MAX_DIM : COLOR_FAST_MAX_DIM);
+        function buildColorFocusedPlan(videoWidth, videoHeight, maxDim = COLOR_FOCUS_MAX_DIM) {
+            if (!colorScanBBox) return null;
+            const focusedBBox = expandBBox(colorScanBBox, getColorFocusPadding(colorScanBBox), videoWidth, videoHeight);
+            if (!focusedBBox) return null;
+            const sw = Math.max(1, Math.ceil(focusedBBox.width));
+            const sh = Math.max(1, Math.ceil(focusedBBox.height));
             const scale = Math.min(1, maxDim / Math.max(sw, sh));
 
             return {
-                sx,
-                sy,
+                sx: Math.floor(focusedBBox.x),
+                sy: Math.floor(focusedBBox.y),
                 sw,
                 sh,
                 targetWidth: Math.max(1, Math.round(sw * scale)),
                 targetHeight: Math.max(1, Math.round(sh * scale))
+            };
+        }
+
+        function buildColorScanPlan(videoWidth, videoHeight) {
+            const refreshFullFrame = colorScanAttemptCount > 0 && (colorScanAttemptCount % COLOR_FOCUS_REFRESH_EVERY === 0);
+            const focusedPlan = !refreshFullFrame ? buildColorFocusedPlan(videoWidth, videoHeight) : null;
+            const useFullFrameFallback = !focusedPlan && (colorScanAttemptCount % COLOR_FULL_SCAN_EVERY === 0);
+
+            if (focusedPlan) return focusedPlan;
+
+            const maxDim = useFullFrameFallback ? COLOR_FULL_MAX_DIM : COLOR_FAST_MAX_DIM;
+            const scale = Math.min(1, maxDim / Math.max(videoWidth, videoHeight));
+            return {
+                sx: 0,
+                sy: 0,
+                sw: videoWidth,
+                sh: videoHeight,
+                targetWidth: Math.max(1, Math.round(videoWidth * scale)),
+                targetHeight: Math.max(1, Math.round(videoHeight * scale))
             };
         }
 
@@ -857,6 +873,64 @@
                 width: localBBox.width * scaleX,
                 height: localBBox.height * scaleY
             }, videoWidth, videoHeight);
+        }
+
+        function updateColorScanFocus(localBBox, plan, videoWidth, videoHeight) {
+            if (!localBBox) return;
+            const mappedBBox = mapScanBBoxToVideo(localBBox, plan, videoWidth, videoHeight);
+            if (!mappedBBox) return;
+            colorScanBBox = mappedBBox;
+            colorScanResult._crop = {
+                x: Math.floor(mappedBBox.x),
+                y: Math.floor(mappedBBox.y),
+                w: Math.ceil(mappedBBox.width),
+                h: Math.ceil(mappedBBox.height)
+            };
+        }
+
+        function runColorScanPlan(plan) {
+            zxingCanvas.width = plan.targetWidth;
+            zxingCanvas.height = plan.targetHeight;
+            zxingCtx.drawImage(video, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.targetWidth, plan.targetHeight);
+
+            const frameData = zxingCtx.getImageData(0, 0, plan.targetWidth, plan.targetHeight);
+            const pixelCount = plan.targetWidth * plan.targetHeight;
+            let localBBox = null;
+
+            const needQ1 = !colorScanResult.qr1;
+            const needQ2 = !colorScanResult.qr2;
+            if (needQ1 || needQ2) {
+                const twin1Mono = buildChannelMonochromeRgba(
+                    frameData.data,
+                    pixelCount,
+                    getTwin1ChannelIndex(colorEncDarkName, colorEncLightName)
+                );
+                const twin1Fast = decodeTargetedColorPair([
+                    { data: twin1Mono, inversionAttempts: 'dontInvert' },
+                    { data: twin1Mono, inversionAttempts: 'attemptBoth' }
+                ], plan.targetWidth, plan.targetHeight, needQ1, needQ2);
+                if (twin1Fast && twin1Fast.results) {
+                    for (const qr of twin1Fast.results) {
+                        assignColorPairResult(colorScanResult, 'qr1', 'qr2', qr);
+                    }
+                }
+                if (twin1Fast && twin1Fast.bbox) {
+                    localBBox = mergeBBox(localBBox, twin1Fast.bbox);
+                }
+            }
+
+            const colorDecoded = processColorQRTwin(frameData, plan.targetWidth, plan.targetHeight, colorScanResult);
+            if (colorDecoded) {
+                mergeColorScanResult(colorDecoded);
+                if (colorDecoded.bbox) {
+                    localBBox = mergeBBox(localBBox, colorDecoded.bbox);
+                }
+            }
+
+            return {
+                localBBox,
+                colorCount: countColorScanResult(colorScanResult)
+            };
         }
 
         function countColorScanResult(result) {
@@ -1430,59 +1504,22 @@
 
                         await refreshColorScanBBox(vw, vh);
                         const plan = buildColorScanPlan(vw, vh);
+                        const primaryPass = runColorScanPlan(plan);
+                        updateColorScanFocus(primaryPass.localBBox, plan, vw, vh);
 
-                        zxingCanvas.width = plan.targetWidth;
-                        zxingCanvas.height = plan.targetHeight;
-                        zxingCtx.drawImage(video, plan.sx, plan.sy, plan.sw, plan.sh, 0, 0, plan.targetWidth, plan.targetHeight);
+                        let colorCount = primaryPass.colorCount;
+                        const refinePlan = buildColorFocusedPlan(vw, vh, COLOR_REFINE_MAX_DIM);
+                        const shouldRefine = refinePlan
+                            && colorCount < 4
+                            && (refinePlan.targetWidth > plan.targetWidth || refinePlan.targetHeight > plan.targetHeight)
+                            && (colorCount > 0 || (colorScanAttemptCount % COLOR_DETECT_REFRESH_EVERY === 0));
 
-                        const frameData = zxingCtx.getImageData(0, 0, plan.targetWidth, plan.targetHeight);
-                        const pixelCount = plan.targetWidth * plan.targetHeight;
-                        let localBBox = null;
-
-                        const needQ1 = !colorScanResult.qr1;
-                        const needQ2 = !colorScanResult.qr2;
-                        if (needQ1 || needQ2) {
-                            const twin1Mono = buildChannelMonochromeRgba(
-                                frameData.data,
-                                pixelCount,
-                                getTwin1ChannelIndex(colorEncDarkName, colorEncLightName)
-                            );
-                            const twin1Fast = decodeTargetedColorPair([
-                                { data: twin1Mono, inversionAttempts: 'dontInvert' },
-                                { data: twin1Mono, inversionAttempts: 'attemptBoth' }
-                            ], plan.targetWidth, plan.targetHeight, needQ1, needQ2);
-                            if (twin1Fast && twin1Fast.results) {
-                                for (const qr of twin1Fast.results) {
-                                    assignColorPairResult(colorScanResult, 'qr1', 'qr2', qr);
-                                }
-                            }
-                            if (twin1Fast && twin1Fast.bbox) {
-                                localBBox = mergeBBox(localBBox, twin1Fast.bbox);
-                            }
+                        if (shouldRefine) {
+                            const refinePass = runColorScanPlan(refinePlan);
+                            updateColorScanFocus(refinePass.localBBox, refinePlan, vw, vh);
+                            colorCount = refinePass.colorCount;
                         }
 
-                        const colorDecoded = processColorQRTwin(frameData, plan.targetWidth, plan.targetHeight, colorScanResult);
-                        if (colorDecoded) {
-                            mergeColorScanResult(colorDecoded);
-                            if (colorDecoded.bbox) {
-                                localBBox = mergeBBox(localBBox, colorDecoded.bbox);
-                            }
-                        }
-
-                        if (localBBox) {
-                            const mappedBBox = mapScanBBoxToVideo(localBBox, plan, vw, vh);
-                            if (mappedBBox) {
-                                colorScanBBox = mappedBBox;
-                                colorScanResult._crop = {
-                                    x: Math.floor(mappedBBox.x),
-                                    y: Math.floor(mappedBBox.y),
-                                    w: Math.ceil(mappedBBox.width),
-                                    h: Math.ceil(mappedBBox.height)
-                                };
-                            }
-                        }
-
-                        const colorCount = countColorScanResult(colorScanResult);
                         if (colorCount > 0 && colorCount < 4) {
                             statusText.innerText = 'Color QR Twin scanning... (' + colorCount + '/4)';
                         }
