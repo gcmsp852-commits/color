@@ -1315,15 +1315,29 @@
 
         function decodeSingleColorQr(scanPass, width, height, acceptQr = null) {
             if (!scanPass || !scanPass.data) return null;
-            const res = jsQR(scanPass.data, width, height, {
+            const opts = {
                 inversionAttempts: scanPass.inversionAttempts || 'attemptBoth',
                 multi: false,
                 preBinarized: !!scanPass.preBinarized,
                 singleLocate: scanPass.singleLocate !== false
-            });
+            };
+            const res = jsQR(scanPass.data, width, height, opts);
             if (!res || !res.data) return null;
-            if (acceptQr && !acceptQr(res)) return null;
-            return res;
+            if (!acceptQr || acceptQr(res)) return res;
+
+            // ★ フィルタ拒否時: multiモードで全QRを検出し、条件に合うものを探す
+            const multiRes = jsQR(scanPass.data, width, height, {
+                inversionAttempts: opts.inversionAttempts,
+                multi: true,
+                preBinarized: opts.preBinarized,
+                singleLocate: false  // より多くの候補を探索
+            });
+            if (!multiRes) return null;
+            const items = Array.isArray(multiRes) ? multiRes : [multiRes];
+            for (const qr of items) {
+                if (qr && qr.data && !qr.isRaw && acceptQr(qr)) return qr;
+            }
+            return null;
         }
 
         function decodeTargetedColorPair(scanPasses, width, height, needZero, needOne) {
@@ -1331,74 +1345,118 @@
             let detectedBBox = null;
             let seed = null;
 
+            // ★ Phase 1: multiモードで全QRを一括検出（最速パス）
             for (const scanPass of scanPasses) {
-                const qr = decodeSingleColorQr(scanPass, width, height);
-                if (!qr) continue;
-                const key = getColorResultKey(qr);
-                if (!found.has(key)) {
-                    found.set(key, qr);
-                    detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                if (!scanPass || !scanPass.data) continue;
+                const multiRes = jsQR(scanPass.data, width, height, {
+                    inversionAttempts: scanPass.inversionAttempts || 'dontInvert',
+                    multi: true,
+                    preBinarized: !!scanPass.preBinarized,
+                    singleLocate: false
+                });
+                if (multiRes) {
+                    const items = Array.isArray(multiRes) ? multiRes : [multiRes];
+                    for (const qr of items) {
+                        if (qr && qr.data && !qr.isRaw) {
+                            const key = getColorResultKey(qr);
+                            if (!found.has(key)) {
+                                found.set(key, qr);
+                                detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                                if (!seed) seed = qr;
+                            }
+                        }
+                    }
                 }
-                seed = qr;
-                break;
+                // multiで両方見つかったらここで終了
+                const hasZero = Array.from(found.values()).some(q => getColorPairTopBit(q) === 0);
+                const hasOne = Array.from(found.values()).some(q => getColorPairTopBit(q) === 1);
+                if ((!needZero || hasZero) && (!needOne || hasOne)) {
+                    return { results: Array.from(found.values()), bbox: detectedBBox };
+                }
+                if (seed) break;
+            }
+
+            // multiで1つも見つからなかった場合、singleモードで試行
+            if (!seed) {
+                for (const scanPass of scanPasses) {
+                    const qr = decodeSingleColorQr(scanPass, width, height);
+                    if (!qr) continue;
+                    const key = getColorResultKey(qr);
+                    if (!found.has(key)) {
+                        found.set(key, qr);
+                        detectedBBox = mergeLocationBBox(detectedBBox, qr);
+                    }
+                    seed = qr;
+                    break;
+                }
             }
 
             if (!seed) {
                 return { results: Array.from(found.values()), bbox: detectedBBox };
             }
 
-            // ★ 高速化: seedがすでにneedZero/needOneの一方を満たしているか判定
             const seedTopBit = getColorPairTopBit(seed);
-            const stillNeedZero = needZero && seedTopBit !== 0;
-            const stillNeedOne = needOne && seedTopBit !== 1;
+            let stillNeedZero = needZero && !Array.from(found.values()).some(q => getColorPairTopBit(q) === 0);
+            let stillNeedOne = needOne && !Array.from(found.values()).some(q => getColorPairTopBit(q) === 1);
 
             if (!stillNeedZero && !stillNeedOne) {
                 return { results: Array.from(found.values()), bbox: detectedBBox };
             }
 
+            // ★ Phase 2: クロップ方式で未発見のQRを探索
             const moduleSize = estimateModuleSizeFromQr(seed);
-            const shiftPx = moduleSize ? Math.max(1, Math.round(moduleSize * 8.5)) : null;
-            if (!shiftPx || shiftPx >= width || shiftPx >= height) {
+            if (!moduleSize) {
                 return { results: Array.from(found.values()), bbox: detectedBBox };
             }
 
-            const cropWidth = width - shiftPx;
-            const cropHeight = height - shiftPx;
+            // ★ 複数のシフト値で試行（moduleSize推定誤差を吸収）
+            const shiftMultipliers = [8.5, 8.0, 9.0];
+            for (const mult of shiftMultipliers) {
+                if (!stillNeedZero && !stillNeedOne) break;
 
-            if (stillNeedZero) {
-                const scanPass = scanPasses[0];
-                const crop = cropMonochromeRgbaImage(scanPass.data, width, height, 0, 0, cropWidth, cropHeight);
-                const qr = decodeSingleColorQr({
-                    data: crop.data,
-                    inversionAttempts: scanPass.inversionAttempts,
-                    preBinarized: scanPass.preBinarized,
-                    singleLocate: scanPass.singleLocate
-                }, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 1);
-                if (qr) {
-                    const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
-                    const key = getColorResultKey(adjusted);
-                    if (!found.has(key)) {
-                        found.set(key, adjusted);
-                        detectedBBox = mergeLocationBBox(detectedBBox, adjusted);
+                const shiftPx = Math.max(1, Math.round(moduleSize * mult));
+                if (shiftPx >= width || shiftPx >= height) continue;
+
+                const cropWidth = width - shiftPx;
+                const cropHeight = height - shiftPx;
+
+                if (stillNeedZero) {
+                    const scanPass = scanPasses[0];
+                    const crop = cropMonochromeRgbaImage(scanPass.data, width, height, 0, 0, cropWidth, cropHeight);
+                    const qr = decodeSingleColorQr({
+                        data: crop.data,
+                        inversionAttempts: scanPass.inversionAttempts,
+                        preBinarized: scanPass.preBinarized,
+                        singleLocate: scanPass.singleLocate
+                    }, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 1);
+                    if (qr) {
+                        const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
+                        const key = getColorResultKey(adjusted);
+                        if (!found.has(key)) {
+                            found.set(key, adjusted);
+                            detectedBBox = mergeLocationBBox(detectedBBox, adjusted);
+                            stillNeedZero = false;
+                        }
                     }
                 }
-            }
 
-            if (stillNeedOne) {
-                const scanPass = scanPasses[0];
-                const crop = cropMonochromeRgbaImage(scanPass.data, width, height, shiftPx, shiftPx, cropWidth, cropHeight);
-                const qr = decodeSingleColorQr({
-                    data: crop.data,
-                    inversionAttempts: scanPass.inversionAttempts,
-                    preBinarized: scanPass.preBinarized,
-                    singleLocate: scanPass.singleLocate
-                }, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 0);
-                if (qr) {
-                    const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
-                    const key = getColorResultKey(adjusted);
-                    if (!found.has(key)) {
-                        found.set(key, adjusted);
-                        detectedBBox = mergeLocationBBox(detectedBBox, adjusted);
+                if (stillNeedOne) {
+                    const scanPass = scanPasses[0];
+                    const crop = cropMonochromeRgbaImage(scanPass.data, width, height, shiftPx, shiftPx, cropWidth, cropHeight);
+                    const qr = decodeSingleColorQr({
+                        data: crop.data,
+                        inversionAttempts: scanPass.inversionAttempts,
+                        preBinarized: scanPass.preBinarized,
+                        singleLocate: scanPass.singleLocate
+                    }, crop.width, crop.height, (item) => getColorPairTopBit(item) !== 0);
+                    if (qr) {
+                        const adjusted = offsetQrResult(qr, crop.offsetX, crop.offsetY);
+                        const key = getColorResultKey(adjusted);
+                        if (!found.has(key)) {
+                            found.set(key, adjusted);
+                            detectedBBox = mergeLocationBBox(detectedBBox, adjusted);
+                            stillNeedOne = false;
+                        }
                     }
                 }
             }
@@ -1586,12 +1644,13 @@
                     }
                 }
 
-                // ★ Ver5精度向上: strict+biasedで見つからなかった場合、attemptBothで再試行
+                // ★ Ver5精度向上: strict+biasedで見つからなかった場合、attemptBothで両データを再試行
                 const retryQr3 = needQr3 && !result.qr3;
                 const retryQr4 = needQr4 && !result.qr4;
                 if (retryQr3 || retryQr4) {
                     const twin2Retry = decodeTargetedColorPair([
-                        { data: twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
+                        { data: twin2StrictData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true },
+                        { data: twin2BiasedData, inversionAttempts: 'attemptBoth', preBinarized: true, singleLocate: true }
                     ], width, height, retryQr3, retryQr4);
                     for (const qr of twin2Retry.results) {
                         assignColorPairResult(result, 'qr3', 'qr4', qr);
